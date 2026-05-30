@@ -1,0 +1,8 @@
+# Optional override: rate limiting off (same as `go run` without -redis).
+#   docker compose -f docker-compose.yml -f docker-compose.no-redis.yml up --build
+services:
+  proxy:
+    depends_on: {}
+    command:
+      - -addr
+      - :8080
