@@ -1,0 +1,36 @@
+goos: linux
+goarch: amd64
+pkg: github.com/thinkinbig/rt-llm-proxy/internal/audio
+cpu: AMD Ryzen AI 7 350 w/ Radeon 860M              
+BenchmarkEncode-16       	    6682	    176056 ns/op	    1281 B/op	       1 allocs/op
+BenchmarkEncode-16       	    7317	    165007 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    7519	    159142 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    7242	    164130 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    7462	    159951 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    7254	    162821 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    7508	    160815 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    6950	    167379 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    7570	    158556 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkEncode-16       	    6296	    160084 ns/op	    1280 B/op	       1 allocs/op
+BenchmarkDecode-16       	   65511	     18438 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   65796	     18072 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   65791	     18412 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   63950	     18721 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   66560	     18651 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   65778	     18180 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   59102	     18444 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   66517	     18499 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   66351	     18266 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkDecode-16       	   61314	     18675 ns/op	    6144 B/op	       1 allocs/op
+BenchmarkRoundtrip-16    	    6525	    184282 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5709	    186652 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5464	    189575 ns/op	    7425 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5691	    186070 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5398	    189608 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5376	    192413 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5450	    189117 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    6228	    191079 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5263	    195163 ns/op	    7424 B/op	       2 allocs/op
+BenchmarkRoundtrip-16    	    5445	    189964 ns/op	    7424 B/op	       2 allocs/op
+PASS
+ok  	github.com/thinkinbig/rt-llm-proxy/internal/audio	34.377s

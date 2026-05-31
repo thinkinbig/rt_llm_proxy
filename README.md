@@ -18,6 +18,7 @@ lives purely on the control plane (the SDP offer endpoint).
 |---|---|---|
 | `gemini` (default) | Gemini Live (`BidiGenerateContent`) | working |
 | `doubao` | Doubao 端到端实时语音 (Volcengine binary V3 WS) | working |
+| `loopback` | fake provider (sine tone, no upstream) — load testing only | working |
 
 ## Prerequisites
 
@@ -28,7 +29,9 @@ lives purely on the control plane (the SDP offer endpoint).
   ```
 - (optional) Redis, for rate limiting
 
-If `proxy.golang.org` is blocked, use a mirror: `go env -w GOPROXY=https://goproxy.cn,direct`.
+**Go module proxy:** default is `https://proxy.golang.org,direct` (abroad). If
+`proxy.golang.org` is blocked or slow, use the China mirror:
+`go env -w GOPROXY=https://goproxy.cn,direct`.
 
 ## Run
 
@@ -46,6 +49,12 @@ Flags:
 | `-redis` | `` (off) | redis address for rate limiting |
 | `-rl-max` | `10` | max sessions per client IP per window |
 | `-rl-window` | `1m` | rate-limit window |
+| `-sidechannel` | `off` | transcript side-channel: `off` \| `stdout` \| `kafka` |
+| `-kafka` | `` | kafka seed brokers (csv) for `-sidechannel=kafka` |
+| `-kafka-topic` | `transcripts` | kafka topic for transcript events |
+| `-admin` | `` (off) | admin listener for `/stats` (JSON) + `/debug/pprof` |
+| `-opus-complexity` | `-1` | Opus encoder complexity 0–10 (-1 = libopus default; lower = less CPU) |
+| `-adaptive` | `off` | adaptive complexity under load: `off` \| `sessions` (recommended) \| `drift` (reactive, can oscillate) |
 
 Env:
 
@@ -62,13 +71,18 @@ Env:
 ## Layout
 
 ```
-cmd/proxy/          HTTP entrypoint, provider routing, rate-limit check
-internal/rtc/       pion WebRTC bridge: SDP offer→answer, Opus<->PCM, audio pump
+cmd/proxy/          HTTP entrypoint, provider routing, rate-limit check, admin
+cmd/loadgen/        pion load generator (pre-encoded Opus replay) for capacity tests
+internal/rtc/       pion WebRTC bridge + session registry; SDP, Opus<->PCM, audio pump
 internal/model/     Model seam (interface only)
 internal/model/gemini/   Gemini Live adapter
 internal/model/doubao/    Doubao realtime dialogue adapter
+internal/model/loopback/  fake provider (sine tone) for load testing
 internal/model/pcm/      shared s16le serialize (uplink bytes)
 internal/audio/     Opus encode/decode (libopus) + linear resampler
+internal/auth/      Authenticator seam (bearer -> user id, fail-open anonymous)
+internal/sidechannel/    transcript tap -> Kafka (protobuf, off the media path)
+internal/metrics/   lock-free frame-interval histogram (the pacing SLO)
 internal/ratelimit/ Redis fixed-window limiter (atomic, fail-open)
 demo/               minimal browser client
 docs/               architecture & engineering notes
@@ -83,12 +97,17 @@ Proxy + Redis (SDP rate limiting). Copy env and start:
 
 ```bash
 cp .env.example .env   # set GEMINI_API_KEY
-docker compose up --build
+docker compose up --build          # Docker: goproxy.io (default)
 # http://localhost:8080/demo/
 ```
 
-If `go mod download` times out on `proxy.golang.org`, the Dockerfile defaults to
-`goproxy.cn` (same as the Prerequisites note). Override: `GOPROXY=https://proxy.golang.org,direct docker compose build`.
+**China** — `proxy.golang.org` / `goproxy.io` slow in Docker; use the CN overlay
+or set `GOPROXY` in `.env`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cn.yml up --build
+# or: GOPROXY=https://goproxy.cn,direct docker compose up --build
+```
 
 Without Redis:
 

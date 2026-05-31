@@ -12,7 +12,7 @@ services:
     build:
       context: .
       args:
-        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        GOPROXY: ${GOPROXY:-https://goproxy.io,direct}
     image: rt-llm-proxy:latest
     restart: unless-stopped
     ports:
