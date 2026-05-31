@@ -21,6 +21,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model/pcm"
 )
 
@@ -137,7 +138,7 @@ func (d *Doubao) Recv() ([]int16, error) {
 	}
 }
 
-func (d *Doubao) RecvTranscript() (transcript, error) {
+func (d *Doubao) recvTranscript() (transcript, error) {
 	select {
 	case <-d.ctx.Done():
 		return transcript{}, io.EOF
@@ -149,18 +150,18 @@ func (d *Doubao) RecvTranscript() (transcript, error) {
 	}
 }
 
-// RecvText drains the next transcript as a "role: text" line for the data
-// channel, skipping bare final markers (empty text). Returns io.EOF on close.
-func (d *Doubao) RecvText() (string, error) {
+// RecvTranscript returns the next transcript turn, skipping turns with empty
+// text. Returns io.EOF on close.
+func (d *Doubao) RecvTranscript() (model.Transcript, error) {
 	for {
-		t, err := d.RecvTranscript()
+		t, err := d.recvTranscript()
 		if err != nil {
-			return "", err
+			return model.Transcript{}, err
 		}
 		if t.Text == "" {
 			continue
 		}
-		return t.Role + ": " + t.Text, nil
+		return model.Transcript{Role: t.Role, Text: t.Text}, nil
 	}
 }
 

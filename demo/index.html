@@ -276,13 +276,13 @@
   .bubble.user {
     align-self: flex-end;
     background: rgba(34, 197, 94, 0.14);
-    border: 1px solid rgba(34, 197, 94, 0.28);
+    border: 1px solid rgba(34, 197, 94, 0.45);
     color: #ecfdf5;
   }
   .bubble.model {
     align-self: flex-start;
     background: rgba(56, 189, 248, 0.12);
-    border: 1px solid rgba(56, 189, 248, 0.25);
+    border: 1px solid rgba(56, 189, 248, 0.42);
     color: #f0f9ff;
   }
   .bubble-label {
@@ -291,9 +291,10 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    opacity: 0.65;
     margin-bottom: 3px;
   }
+  .bubble.user .bubble-label { color: #4ade80; }
+  .bubble.model .bubble-label { color: #38bdf8; }
 
   details.log-panel {
     margin-top: 10px;

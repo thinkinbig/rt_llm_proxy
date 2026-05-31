@@ -17,6 +17,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model/pcm"
 )
 
@@ -94,7 +95,7 @@ type Gemini struct {
 	conn   *websocket.Conn
 	writeM sync.Mutex
 	recvCh chan []int16
-	textCh chan string // "user: …" / "model: …" lines for the data channel
+	textCh chan model.Transcript
 
 	// Transcription arrives as deltas; we accumulate per role so the data
 	// channel carries the full sentence so far (the browser replaces the bubble
@@ -130,7 +131,7 @@ func New(ctx context.Context) (*Gemini, error) {
 
 	g := &Gemini{
 		ctx: cctx, cancel: cancel, conn: conn,
-		recvCh: make(chan []int16, 64), textCh: make(chan string, 64),
+		recvCh: make(chan []int16, 64), textCh: make(chan model.Transcript, 64),
 	}
 
 	var setup geminiSetup
@@ -195,15 +196,15 @@ func (g *Gemini) Recv() ([]int16, error) {
 	}
 }
 
-func (g *Gemini) RecvText() (string, error) {
+func (g *Gemini) RecvTranscript() (model.Transcript, error) {
 	select {
 	case <-g.ctx.Done():
-		return "", io.EOF
-	case line, ok := <-g.textCh:
+		return model.Transcript{}, io.EOF
+	case tr, ok := <-g.textCh:
 		if !ok {
-			return "", io.EOF
+			return model.Transcript{}, io.EOF
 		}
-		return line, nil
+		return tr, nil
 	}
 }
 
@@ -211,9 +212,8 @@ func (g *Gemini) emitText(role, text string) {
 	if text == "" {
 		return
 	}
-	line := role + ": " + text
 	select {
-	case g.textCh <- line:
+	case g.textCh <- model.Transcript{Role: role, Text: text}:
 	case <-g.ctx.Done():
 	}
 }

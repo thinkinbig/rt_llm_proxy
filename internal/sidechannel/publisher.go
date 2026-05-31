@@ -9,7 +9,10 @@
 // rate limiting.
 package sidechannel
 
-import "log"
+import (
+	"context"
+	"log"
+)
 
 // Publisher accepts transcript events for asynchronous delivery. Publish must
 // not block the caller: the media bridge calls it on the hot text path, so a
@@ -17,6 +20,12 @@ import "log"
 type Publisher interface {
 	Publish(ev *TranscriptEvent)
 	Close() error
+}
+
+// Replayer is an optional extension for publishers that can read transcript
+// events back by session. Implemented by Kafka to support reconnect replay.
+type Replayer interface {
+	Replay(ctx context.Context, sessionID, provider string, afterSeq uint64, limit int) ([]*TranscriptEvent, error)
 }
 
 // Nop discards every event. It is the default when no broker is configured.

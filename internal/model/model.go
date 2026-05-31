@@ -5,6 +5,13 @@
 // native Opus rate). Each adapter resamples to/from its own wire format internally.
 package model
 
+// Transcript is one speech-to-text turn returned by a model that supports
+// transcription. Role is "user" or "model".
+type Transcript struct {
+	Role string
+	Text string
+}
+
 type Model interface {
 	// SendAudio sends a chunk of microphone PCM (mono s16, 48kHz).
 	SendAudio(pcm []int16) error

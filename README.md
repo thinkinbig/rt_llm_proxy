@@ -52,6 +52,14 @@ Flags:
 | `-sidechannel` | `off` | transcript side-channel: `off` \| `stdout` \| `kafka` |
 | `-kafka` | `` | kafka seed brokers (csv) for `-sidechannel=kafka` |
 | `-kafka-topic` | `transcripts` | kafka topic for transcript events |
+| `-replay-kafka` | `false` | enable best-effort cross-node reconnect replay from Kafka |
+| `-replay-timeout` | `300ms` | hard replay timeout budget (keep reconnect latency bounded) |
+| `-replay-limit` | `100` | max replayed transcript lines per reconnect |
+| `-model-cb` | `true` | circuit-break model connect attempts (`gemini` / `doubao`) |
+| `-model-cb-open-after` | `5` | transient failures before opening breaker |
+| `-model-cb-open-for` | `30s` | open duration for transient failures |
+| `-model-cb-half-open-success` | `3` | successful half-open probes needed to close |
+| `-model-cb-auth-open-for` | `5m` | open duration for auth failures (`401/403`) |
 | `-admin` | `` (off) | admin listener for `/stats` (JSON) + `/debug/pprof` |
 | `-opus-complexity` | `-1` | Opus encoder complexity 0–10 (-1 = libopus default; lower = less CPU) |
 | `-adaptive` | `off` | adaptive complexity under load: `off` \| `sessions` (recommended) \| `drift` (reactive, can oscillate) |
@@ -144,18 +152,35 @@ so `hostNetwork`/`replicas: N` don't make media work; that needs a TURN relay.
 | Level | Goal | Status here |
 |---|---|---|
 | L1 | server dies → client reconnects, service stays up | reachable once replicated behind TURN |
-| L2 | reconnect restores the *session* | **half-built** — server-minted `session_id` exists; needs a client reconnect protocol + server-side session lookup |
-| L3 | reconnect resumes *progress* | **half-built** — the Kafka side-channel is a replayable event log with a per-session `seq`; a new pod could resume from `session_id`+`last_seq` |
+| L2 | reconnect restores the *session* | **basic implementation** — demo client sends `X-Session-ID` + `X-Last-Seq`; proxy resumes same-node session and reuses the session id |
+| L3 | reconnect resumes *progress* | **partial** — same-node replay is in-memory; optional cross-node replay is best-effort via Kafka tail scan (`session_id` + `last_seq`) |
 | L4 | near-seamless connection migration | impractical (fd/media affinity) — don't chase it |
 
 So it's **not "can't be done"** — the design already leans the right way: the
 proxy is thin (state behind the `Model` seam), key events are externalized to a
 replayable Kafka log keyed by `user_id` with a monotonic `seq`, and `session_id`
-is server-minted. What's missing for L2/L3 is a **client reconnect protocol** and
-**server-side context restore from `session_id`+`last_seq`**. The hard caveat:
+is server-minted. With `-replay-kafka=true`, we do a **best-effort cross-node
+replay** from Kafka using `session_id`+`last_seq`; for stronger L3 this should
+evolve from a bounded tail scan to a dedicated replay index/consumer service.
+The hard caveat:
 the *provider's* dialogue context (Gemini/Doubao) lives in their server-side
 socket, so we can restore our session metadata and transcribed text, but cannot
 guarantee the upstream model resumes mid-thought.
+
+Reconnect protocol notes:
+
+- Replay protocol version is `X-Replay-Version: 1`.
+- Server returns `X-Replay-Status` as one of:
+  `memory_hit`, `kafka_hit`, `kafka_timeout`, `kafka_error`, `miss`,
+  `disabled`, `protocol_invalid`.
+- Replay requires both `X-Session-ID` and `X-Last-Seq`; malformed
+  `X-Last-Seq` or unsupported replay version returns `400`.
+- Reconnect replay is provider-scoped (`gemini` sessions do not replay into
+  `doubao`, and vice versa).
+- Model circuit-breaker rejects open circuits with `503` plus
+  `Retry-After`, `X-Model-CB-State`, and `X-Model-CB-Reason`.
+- Per-provider overrides are available for both `gemini` and `doubao`:
+  `-model-cb-*-gemini` / `-model-cb-*-doubao` (`0` means "use global default").
 
 **For production scale today, front it with a mature media layer** — coturn
 (TURN) for reachability and an SFU / realtime-agent framework (LiveKit, Pipecat)

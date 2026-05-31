@@ -22,7 +22,7 @@ type Meta struct {
 // wrapper types and the assertion in Wrap. Go cannot conditionally implement an
 // interface, so this split is load-bearing, not stylistic.
 type transcriber interface {
-	RecvText() (string, error)
+	RecvTranscript() (model.Transcript, error)
 }
 
 // observing wraps a model.Model and taps SendText (user input) into the
@@ -62,12 +62,16 @@ type observingTranscriber struct {
 	inner transcriber
 }
 
-func (o *observingTranscriber) RecvText() (string, error) {
-	line, err := o.inner.RecvText()
+func (o *observingTranscriber) RecvTranscript() (model.Transcript, error) {
+	tr, err := o.inner.RecvTranscript()
 	if err == nil {
-		o.observing.emit(Role_ROLE_MODEL, line)
+		role := Role_ROLE_MODEL
+		if tr.Role == "user" {
+			role = Role_ROLE_USER
+		}
+		o.observing.emit(role, tr.Text)
 	}
-	return line, err
+	return tr, err
 }
 
 // Wrap decorates m so its transcripts flow to pub. If pub is nil the model is

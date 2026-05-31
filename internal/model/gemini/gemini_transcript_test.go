@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 )
 
 func TestParseInputTranscription(t *testing.T) {
@@ -13,12 +15,12 @@ func TestParseInputTranscription(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
 	}
-	g := &Gemini{ctx: context.Background(), textCh: make(chan string, 1)}
+	g := &Gemini{ctx: context.Background(), textCh: make(chan model.Transcript, 1)}
 	g.handleTranscription("user", msg.ServerContent.InputTranscription)
 	select {
-	case line := <-g.textCh:
-		if line != "user: 你好" {
-			t.Fatalf("got %q", line)
+	case tr := <-g.textCh:
+		if tr.Role != "user" || tr.Text != "你好" {
+			t.Fatalf("got %+v", tr)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no transcript")
@@ -26,27 +28,27 @@ func TestParseInputTranscription(t *testing.T) {
 }
 
 func TestAccumulatesFragments(t *testing.T) {
-	g := &Gemini{ctx: context.Background(), textCh: make(chan string, 8)}
+	g := &Gemini{ctx: context.Background(), textCh: make(chan model.Transcript, 8)}
 	for _, frag := range []string{"今", "天", "天气"} {
 		g.handleTranscription("user", &geminiTranscription{Text: frag})
 	}
-	want := []string{"user: 今", "user: 今天", "user: 今天天气"}
+	want := []string{"今", "今天", "今天天气"}
 	for _, w := range want {
-		if got := <-g.textCh; got != w {
-			t.Fatalf("got %q want %q", got, w)
+		if got := <-g.textCh; got.Role != "user" || got.Text != w {
+			t.Fatalf("got %+v want {user %q}", got, w)
 		}
 	}
 }
 
 func TestResetsAfterFinished(t *testing.T) {
-	g := &Gemini{ctx: context.Background(), textCh: make(chan string, 8)}
+	g := &Gemini{ctx: context.Background(), textCh: make(chan model.Transcript, 8)}
 	g.handleTranscription("user", &geminiTranscription{Text: "你好"})
 	g.handleTranscription("user", &geminiTranscription{Text: "吗", Finished: true})
 	g.handleTranscription("user", &geminiTranscription{Text: "再见"})
-	want := []string{"user: 你好", "user: 你好吗", "user: 再见"}
+	want := []string{"你好", "你好吗", "再见"}
 	for _, w := range want {
-		if got := <-g.textCh; got != w {
-			t.Fatalf("got %q want %q", got, w)
+		if got := <-g.textCh; got.Role != "user" || got.Text != w {
+			t.Fatalf("got %+v want {user %q}", got, w)
 		}
 	}
 }
@@ -57,27 +59,27 @@ func TestParseOutputTranscription(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
 	}
-	g := &Gemini{ctx: context.Background(), textCh: make(chan string, 1)}
+	g := &Gemini{ctx: context.Background(), textCh: make(chan model.Transcript, 1)}
 	g.handleTranscription("model", msg.OutputTranscription)
-	line := <-g.textCh
-	if line != "model: Hi there" {
-		t.Fatalf("got %q", line)
+	tr := <-g.textCh
+	if tr.Role != "model" || tr.Text != "Hi there" {
+		t.Fatalf("got %+v", tr)
 	}
 }
 
 func TestStripsCJKOutputSpaces(t *testing.T) {
-	g := &Gemini{ctx: context.Background(), textCh: make(chan string, 16)}
+	g := &Gemini{ctx: context.Background(), textCh: make(chan model.Transcript, 16)}
 	for _, frag := range []string{"你", " 好", " ！", " 很", " 高", " 兴"} {
 		g.handleTranscription("model", &geminiTranscription{Text: frag})
 	}
-	var last string
+	var last model.Transcript
 	for {
 		select {
-		case line := <-g.textCh:
-			last = line
+		case tr := <-g.textCh:
+			last = tr
 		default:
-			if last != "model: 你好！很高兴" {
-				t.Fatalf("got %q", last)
+			if last.Role != "model" || last.Text != "你好！很高兴" {
+				t.Fatalf("got %+v", last)
 			}
 			return
 		}
@@ -85,13 +87,13 @@ func TestStripsCJKOutputSpaces(t *testing.T) {
 }
 
 func TestPreservesEnglishOutputSpaces(t *testing.T) {
-	g := &Gemini{ctx: context.Background(), textCh: make(chan string, 4)}
+	g := &Gemini{ctx: context.Background(), textCh: make(chan model.Transcript, 4)}
 	g.handleTranscription("model", &geminiTranscription{Text: "Hi"})
 	g.handleTranscription("model", &geminiTranscription{Text: " there"})
-	if got := <-g.textCh; got != "model: Hi" {
-		t.Fatalf("first line got %q", got)
+	if got := <-g.textCh; got.Role != "model" || got.Text != "Hi" {
+		t.Fatalf("first: got %+v", got)
 	}
-	if got := <-g.textCh; got != "model: Hi there" {
-		t.Fatalf("second line got %q", got)
+	if got := <-g.textCh; got.Role != "model" || got.Text != "Hi there" {
+		t.Fatalf("second: got %+v", got)
 	}
 }

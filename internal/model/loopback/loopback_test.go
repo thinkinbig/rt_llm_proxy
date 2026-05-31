@@ -32,8 +32,8 @@ func TestCloseStopsRecvAndIsIdempotent(t *testing.T) {
 	if _, err := m.Recv(); err != io.EOF {
 		t.Errorf("Recv after Close = %v, want EOF", err)
 	}
-	if _, err := m.RecvText(); err != io.EOF {
-		t.Errorf("RecvText after Close = %v, want EOF", err)
+	if _, err := m.RecvTranscript(); err != io.EOF {
+		t.Errorf("RecvTranscript after Close = %v, want EOF", err)
 	}
 	m.Close() // must not panic on double close
 }

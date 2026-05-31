@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 )
 
 const (
@@ -61,15 +62,15 @@ func (m *Model) Recv() ([]int16, error) {
 	return out, nil
 }
 
-// RecvText emits a synthetic transcript line on a slow cadence so load tests
+// RecvTranscript emits a synthetic transcript on a slow cadence so load tests
 // exercise the transcript + side-channel path without flooding it.
-func (m *Model) RecvText() (string, error) {
+func (m *Model) RecvTranscript() (model.Transcript, error) {
 	select {
 	case <-m.closed:
-		return "", io.EOF
+		return model.Transcript{}, io.EOF
 	case <-time.After(transcriptEvery):
 		m.n++
-		return fmt.Sprintf("loopback transcript %d", m.n), nil
+		return model.Transcript{Role: "model", Text: fmt.Sprintf("loopback transcript %d", m.n)}, nil
 	}
 }
 

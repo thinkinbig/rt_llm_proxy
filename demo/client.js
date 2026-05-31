@@ -8,13 +8,16 @@ const audioEl = $('audio');
 const transcriptEl = $('transcript');
 const transcriptEmpty = $('transcript-empty');
 const transcriptBadge = $('transcript-badge');
+const SESSION_STORAGE_KEY = 'rt-llm-proxy.session';
 
 let pc = null;
 let dc = null;
 let localStream = null;
 let audioCtx = null;
 let rafId = null;
+let cbCountdownId = null;
 let connected = false;
+let sessionState = loadSessionState();
 
 function log(msg) {
   const t = new Date().toLocaleTimeString();
@@ -54,6 +57,29 @@ function clearTranscript() {
   transcriptEmpty.hidden = false;
 }
 
+function loadSessionState() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return { id: '', lastSeq: 0, model: '' };
+    const parsed = JSON.parse(raw);
+    return {
+      id: typeof parsed.id === 'string' ? parsed.id : '',
+      lastSeq: Number.isFinite(parsed.lastSeq) ? Math.max(0, parsed.lastSeq) : 0,
+      model: typeof parsed.model === 'string' ? parsed.model : '',
+    };
+  } catch {
+    return { id: '', lastSeq: 0, model: '' };
+  }
+}
+
+function saveSessionState() {
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionState));
+  } catch {
+    // Ignore storage failures (private mode / quota).
+  }
+}
+
 function dcText(raw) {
   if (typeof raw === 'string') return raw;
   if (raw instanceof ArrayBuffer) return new TextDecoder().decode(raw);
@@ -85,12 +111,62 @@ function showTranscript(role, text) {
 function handleDataChannelMessage(raw) {
   const line = dcText(raw).trim();
   if (!line) return;
+  try {
+    const msg = JSON.parse(line);
+    if (msg && typeof msg.role === 'string' && typeof msg.text === 'string') {
+      if (Number.isFinite(msg.seq)) {
+        sessionState.lastSeq = Math.max(sessionState.lastSeq, Number(msg.seq));
+        saveSessionState();
+      }
+      showTranscript(msg.role, msg.text);
+      return;
+    }
+  } catch {
+    // Backward-compatible fallback: server always sends JSON, but this regex
+    // guards against any non-JSON message (e.g. debug tools or future clients).
+  }
   const m = line.match(/^(user|model):\s*(.*)$/s);
   if (m) {
+    sessionState.lastSeq += 1;
+    saveSessionState();
     showTranscript(m[1], m[2]);
     return;
   }
   log('« ' + line);
+}
+
+function cbReasonLabel(reason) {
+  const map = {
+    auth: '鉴权失败',
+    transient: '上游抖动',
+    other: '上游异常',
+  };
+  return map[reason] || reason || '上游异常';
+}
+
+function clearCbCountdown() {
+  if (cbCountdownId != null) {
+    clearInterval(cbCountdownId);
+    cbCountdownId = null;
+  }
+}
+
+function cbHintText(secondsLeft, reason) {
+  const label = cbReasonLabel(reason);
+  if (secondsLeft > 0) return `${secondsLeft}s 后可重试（${label}）`;
+  return `可重试（${label}）`;
+}
+
+function startCbCountdown(retryAfterSec, reason) {
+  clearCbCountdown();
+  let left = Math.max(0, parseInt(retryAfterSec, 10) || 0);
+  if (statusHint) statusHint.textContent = cbHintText(left, reason);
+  if (left <= 0) return;
+  cbCountdownId = setInterval(() => {
+    left -= 1;
+    if (statusHint) statusHint.textContent = cbHintText(left, reason);
+    if (left <= 0) clearCbCountdown();
+  }, 1000);
 }
 
 // --- device list ---
@@ -139,9 +215,12 @@ function startMeterLoop(fns) {
 
 // --- connect / disconnect ---
 async function start() {
+  clearCbCountdown();
   const model = $('model').value;
+  const resume = sessionState.id && sessionState.model === model;
+  const priorSessionID = sessionState.id;
   updateTranscriptBadge(model);
-  clearTranscript();
+  if (!resume) clearTranscript();
 
   toggleBtn.disabled = true;
   setStatus('connecting', '连接中…', '正在请求麦克风…');
@@ -189,19 +268,53 @@ async function start() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     log('SDP → ?model=' + model);
+    const headers = { 'Content-Type': 'application/sdp' };
+    if (resume) {
+      headers['X-Session-ID'] = sessionState.id;
+      headers['X-Last-Seq'] = String(sessionState.lastSeq);
+      headers['X-Replay-Version'] = '1';
+    }
     const resp = await fetch(`/?model=${model}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/sdp' },
+      headers,
       body: offer.sdp,
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+    if (!resp.ok) {
+      const cbState = resp.headers.get('X-Model-CB-State');
+      const cbReason = resp.headers.get('X-Model-CB-Reason');
+      const retryAfter = resp.headers.get('Retry-After');
+      const detail = await resp.text();
+      if (resp.status === 503 && cbState) {
+        stop({ keepStatus: true });
+        toggleBtn.disabled = false;
+        setStatus('error', '上游熔断中');
+        if (retryAfter) {
+          startCbCountdown(retryAfter, cbReason);
+        } else if (statusHint) {
+          statusHint.textContent = `稍后重试（${cbReasonLabel(cbReason)}）`;
+        }
+        log(`熔断 ${cbState} reason=${cbReason || 'unknown'} retry_after=${retryAfter || '-'}`);
+        return;
+      }
+      throw new Error(`HTTP ${resp.status}: ${detail}`);
+    }
+    const replayStatus = resp.headers.get('X-Replay-Status');
+    if (replayStatus) log('replay ' + replayStatus);
+    const sessionID = resp.headers.get('X-Session-ID') || sessionState.id;
+    if (!resume || !sessionID || sessionID !== priorSessionID) {
+      clearTranscript();
+      sessionState.lastSeq = 0;
+    }
+    sessionState.id = sessionID;
+    sessionState.model = model;
+    saveSessionState();
     const answer = await resp.text();
     await pc.setRemoteDescription({ type: 'answer', sdp: answer });
     log('SDP 完成');
   } catch (e) {
-    setStatus('error', '信令失败');
-    log('协商失败: ' + e.message);
     stop();
+    setStatus('error', '信令失败', '可重试或查看日志');
+    log('协商失败: ' + e.message);
     return;
   }
 
@@ -211,7 +324,8 @@ async function start() {
   setStatus('live', '通话中');
 }
 
-function stop() {
+function stop(opts = {}) {
+  clearCbCountdown();
   connected = false;
   $('model').disabled = $('mic').disabled = false;
   updateTranscriptBadge($('model').value);
@@ -224,7 +338,7 @@ function stop() {
   if (pc) { try { pc.close(); } catch {} pc = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   audioEl.srcObject = null;
-  setStatus('', '未连接');
+  if (!opts.keepStatus) setStatus('', '未连接');
   log('结束');
 }
 

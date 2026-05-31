@@ -15,20 +15,20 @@ func (f *fakeModel) SendText(t string) error { f.sent = append(f.sent, t); retur
 func (f *fakeModel) Recv() ([]int16, error)  { return nil, io.EOF }
 func (f *fakeModel) Close() error            { return nil }
 
-// fakeTranscriber additionally surfaces RecvText.
+// fakeTranscriber additionally surfaces RecvTranscript.
 type fakeTranscriber struct {
 	*fakeModel
-	lines []string
+	lines []model.Transcript
 	i     int
 }
 
-func (f *fakeTranscriber) RecvText() (string, error) {
+func (f *fakeTranscriber) RecvTranscript() (model.Transcript, error) {
 	if f.i >= len(f.lines) {
-		return "", io.EOF
+		return model.Transcript{}, io.EOF
 	}
-	s := f.lines[f.i]
+	tr := f.lines[f.i]
 	f.i++
-	return s, nil
+	return tr, nil
 }
 
 type capture struct{ evs []*TranscriptEvent }
@@ -36,8 +36,8 @@ type capture struct{ evs []*TranscriptEvent }
 func (c *capture) Publish(ev *TranscriptEvent) { c.evs = append(c.evs, ev) }
 func (c *capture) Close() error                { return nil }
 
-type recvTexter interface {
-	RecvText() (string, error)
+type recvTranscripter interface {
+	RecvTranscript() (model.Transcript, error)
 }
 
 func TestPartitionKey(t *testing.T) {
@@ -59,7 +59,7 @@ func TestWrapNilPublisherIsPassthrough(t *testing.T) {
 func TestWrapNonTranscriberHasNoRecvText(t *testing.T) {
 	cap := &capture{}
 	w := Wrap(&fakeModel{}, cap, Meta{SessionID: "s1", UserID: "alice", Provider: "gemini"})
-	if _, ok := w.(recvTexter); ok {
+	if _, ok := w.(recvTranscripter); ok {
 		t.Fatal("wrapper must NOT satisfy transcriber when inner does not")
 	}
 	if err := w.SendText("hi"); err != nil {
@@ -77,17 +77,17 @@ func TestWrapNonTranscriberHasNoRecvText(t *testing.T) {
 
 func TestWrapTranscriberTapsBothDirections(t *testing.T) {
 	cap := &capture{}
-	inner := &fakeTranscriber{fakeModel: &fakeModel{}, lines: []string{"hello"}}
+	inner := &fakeTranscriber{fakeModel: &fakeModel{}, lines: []model.Transcript{{Role: "model", Text: "hello"}}}
 	w := Wrap(inner, cap, Meta{SessionID: "s1"})
-	rt, ok := w.(recvTexter)
+	rt, ok := w.(recvTranscripter)
 	if !ok {
 		t.Fatal("wrapper MUST satisfy transcriber when inner does")
 	}
 
-	_ = w.SendText("hi")            // user event, seq 1
-	line, err := rt.RecvText()      // model event, seq 2
-	if err != nil || line != "hello" {
-		t.Fatalf("RecvText = %q, %v", line, err)
+	_ = w.SendText("hi")                   // user event, seq 1
+	tr, err := rt.RecvTranscript()          // model event, seq 2
+	if err != nil || tr.Text != "hello" {
+		t.Fatalf("RecvTranscript = %+v, %v", tr, err)
 	}
 	if len(inner.sent) != 1 || inner.sent[0] != "hi" {
 		t.Errorf("SendText not passed through: %v", inner.sent)
@@ -103,12 +103,12 @@ func TestWrapTranscriberTapsBothDirections(t *testing.T) {
 	}
 }
 
-// On RecvText error nothing is published (we only tap successful lines).
+// On RecvTranscript error nothing is published (we only tap successful lines).
 func TestWrapTranscriberErrorNoEmit(t *testing.T) {
 	cap := &capture{}
 	inner := &fakeTranscriber{fakeModel: &fakeModel{}} // no lines -> immediate EOF
 	w := Wrap(inner, cap, Meta{SessionID: "s1"})
-	if _, err := w.(recvTexter).RecvText(); err != io.EOF {
+	if _, err := w.(recvTranscripter).RecvTranscript(); err != io.EOF {
 		t.Fatalf("want EOF, got %v", err)
 	}
 	if len(cap.evs) != 0 {

@@ -15,7 +15,8 @@ browser ──WebRTC(Opus audio + datachannel)──▶ proxy ──WebSocket(PC
 - **Outbound (model → speaker):** `Model.Recv` → accumulate into a buffer →
   Opus-encode each 20ms / 960-sample frame → `WriteSample`, **paced at real time**.
 - **Data channel:** browser text → `Model.SendText`; model transcripts
-  (`RecvText`) → browser, as `role: text` lines.
+  (`RecvText`) → browser as JSON lines `{seq,role,text}` so reconnect can
+  resume from `last_seq`.
 
 ## 2. Modules & seams
 
@@ -142,6 +143,33 @@ good enough for speech. Swap for a polyphase filter if quality ever matters.
   fill and stall the outbound track.
 - **Session outlives the request:** model connect + `Serve` use a background
   context, so the media session isn't bound to the SDP HTTP request's lifetime.
+
+### 3.9 Reconnect replay policy (best effort, bounded)  *(`cmd/proxy/main.go`, `internal/sidechannel/kafka.go`)*
+
+- **Protocol:** reconnect uses `X-Replay-Version: 1`, `X-Session-ID`,
+  `X-Last-Seq`; server replies with `X-Replay-Status`.
+- **Strict but non-blocking:** malformed `X-Last-Seq` / unsupported replay
+  version returns `400`; missing id/seq simply falls back to a new session.
+- **Provider scoped:** replay only when reconnect provider matches the original
+  session/provider to avoid cross-model transcript contamination.
+- **Order of sources:** memory archive first (same node), optional Kafka replay
+  second (`-replay-kafka=true`) with hard budget (`-replay-timeout`,
+  default `300ms`) and bounded lines (`-replay-limit`, default `100`).
+- **Invariant preserved:** replay is control-plane best effort; timeout/error
+  never blocks media startup, and can be disabled globally with `-replay-kafka=false`.
+
+### 3.10 Model-connect circuit breaker  *(`cmd/proxy/main.go`, `internal/modelcb`)*
+
+- **Scope:** only wraps provider connect (`gemini.New` / `doubao.New`) on the
+  offer path. Established media sessions are unaffected.
+- **Policy:** fail with `503` when circuit is open/half-open gated, with
+  `Retry-After`, `X-Model-CB-State`, `X-Model-CB-Reason`.
+- **State machine:** `closed -> open -> half_open -> closed`; half-open allows
+  a single probe request at a time per provider.
+- **Error sensitivity:** auth-class failures (`401/403`, unauthorized/forbidden)
+  open immediately with a longer hold (`-model-cb-auth-open-for`, default 5m);
+  transient failures open after `-model-cb-open-after` consecutive misses.
+- **Isolation:** breakers are per provider, with optional per-provider overrides.
 
 ## 4. Tests
 
