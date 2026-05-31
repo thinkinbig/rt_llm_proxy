@@ -1,4 +1,4 @@
-package model
+package gemini
 
 import (
 	"context"
@@ -11,10 +11,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/pcm"
 )
 
 // Gemini Live wants 16kHz PCM in and emits 24kHz PCM out.
@@ -35,7 +38,14 @@ type geminiSetup struct {
 		GenerationConfig struct {
 			ResponseModalities []string `json:"responseModalities"`
 		} `json:"generationConfig"`
+		InputAudioTranscription  struct{} `json:"inputAudioTranscription"`
+		OutputAudioTranscription struct{} `json:"outputAudioTranscription"`
 	} `json:"setup"`
+}
+
+type geminiTranscription struct {
+	Text     string `json:"text"`
+	Finished bool   `json:"finished"`
 }
 
 type geminiBlob struct {
@@ -62,10 +72,16 @@ type geminiClientContent struct {
 }
 
 type geminiServerMsg struct {
-	SetupComplete *struct{} `json:"setupComplete"`
-	ServerContent *struct {
-		ModelTurn *struct {
+	SetupComplete       *struct{}            `json:"setupComplete"`
+	InputTranscription  *geminiTranscription `json:"inputTranscription"`
+	OutputTranscription *geminiTranscription `json:"outputTranscription"`
+	ServerContent       *struct {
+		TurnComplete        bool                 `json:"turnComplete"`
+		InputTranscription  *geminiTranscription `json:"inputTranscription"`
+		OutputTranscription *geminiTranscription `json:"outputTranscription"`
+		ModelTurn           *struct {
 			Parts []struct {
+				Text       string      `json:"text"`
 				InlineData *geminiBlob `json:"inlineData"`
 			} `json:"parts"`
 		} `json:"modelTurn"`
@@ -78,9 +94,16 @@ type Gemini struct {
 	conn   *websocket.Conn
 	writeM sync.Mutex
 	recvCh chan []int16
+	textCh chan string // "user: …" / "model: …" lines for the data channel
+
+	// Transcription arrives as deltas; we accumulate per role so the data
+	// channel carries the full sentence so far (the browser replaces the bubble
+	// body on each line). Reset at turn boundaries. Touched only by readLoop.
+	userBuf  strings.Builder
+	modelBuf strings.Builder
 }
 
-func NewGemini(ctx context.Context) (*Gemini, error) {
+func New(ctx context.Context) (*Gemini, error) {
 	key := os.Getenv("GEMINI_API_KEY")
 	if key == "" {
 		key = os.Getenv("GOOGLE_API_KEY")
@@ -88,12 +111,12 @@ func NewGemini(ctx context.Context) (*Gemini, error) {
 	if key == "" {
 		return nil, fmt.Errorf("gemini: set GEMINI_API_KEY or GOOGLE_API_KEY")
 	}
-	model := os.Getenv("GEMINI_MODEL")
-	if model == "" {
+	modelName := os.Getenv("GEMINI_MODEL")
+	if modelName == "" {
 		// Must support bidiGenerateContent. Verify with:
 		//   curl ".../v1beta/models?key=$KEY&pageSize=200" | jq '.models[]
 		//     | select(.supportedGenerationMethods[]?=="bidiGenerateContent").name'
-		model = "models/gemini-2.5-flash-native-audio-latest"
+		modelName = "models/gemini-2.5-flash-native-audio-latest"
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -105,11 +128,16 @@ func NewGemini(ctx context.Context) (*Gemini, error) {
 	// Audio messages from the server are large; lift the default 32KB read cap.
 	conn.SetReadLimit(16 << 20)
 
-	g := &Gemini{ctx: cctx, cancel: cancel, conn: conn, recvCh: make(chan []int16, 64)}
+	g := &Gemini{
+		ctx: cctx, cancel: cancel, conn: conn,
+		recvCh: make(chan []int16, 64), textCh: make(chan string, 64),
+	}
 
 	var setup geminiSetup
-	setup.Setup.Model = model
+	setup.Setup.Model = modelName
 	setup.Setup.GenerationConfig.ResponseModalities = []string{"AUDIO"}
+	setup.Setup.InputAudioTranscription = struct{}{}
+	setup.Setup.OutputAudioTranscription = struct{}{}
 	if err := g.writeJSON(setup); err != nil {
 		g.Close()
 		return nil, fmt.Errorf("gemini: setup: %w", err)
@@ -129,12 +157,12 @@ func (g *Gemini) writeJSON(v any) error {
 	return g.conn.Write(g.ctx, websocket.MessageText, b)
 }
 
-func (g *Gemini) SendAudio(pcm []int16) error {
-	in := audio.ResampleLinear(pcm, audio.OpusRate, geminiInRate)
+func (g *Gemini) SendAudio(pcmSamples []int16) error {
+	in := audio.ResampleLinear(pcmSamples, audio.OpusRate, geminiInRate)
 	var msg geminiRealtimeInput
 	msg.RealtimeInput.MediaChunks = []geminiBlob{{
 		MimeType: "audio/pcm;rate=" + strconv.Itoa(geminiInRate),
-		Data:     base64.StdEncoding.EncodeToString(pcmToBytes(in)),
+		Data:     base64.StdEncoding.EncodeToString(pcm.ToBytes(in)),
 	}}
 	return g.writeJSON(msg)
 }
@@ -159,16 +187,46 @@ func (g *Gemini) Recv() ([]int16, error) {
 	select {
 	case <-g.ctx.Done():
 		return nil, io.EOF
-	case pcm, ok := <-g.recvCh:
+	case samples, ok := <-g.recvCh:
 		if !ok {
 			return nil, io.EOF
 		}
-		return pcm, nil
+		return samples, nil
 	}
+}
+
+func (g *Gemini) RecvText() (string, error) {
+	select {
+	case <-g.ctx.Done():
+		return "", io.EOF
+	case line, ok := <-g.textCh:
+		if !ok {
+			return "", io.EOF
+		}
+		return line, nil
+	}
+}
+
+func (g *Gemini) emitText(role, text string) {
+	if text == "" {
+		return
+	}
+	line := role + ": " + text
+	select {
+	case g.textCh <- line:
+	case <-g.ctx.Done():
+	}
+}
+
+// inlineAudioToModelPCM turns one inline-data audio part into mono s16 at 48kHz
+// (Model contract). Wire format is s16le; native rate comes from the part MIME.
+func inlineAudioToModelPCM(raw []byte, mime string) []int16 {
+	return audio.ResampleLinear(pcm.FromBytes(raw), rateFromMime(mime, geminiOutRate), audio.OpusRate)
 }
 
 func (g *Gemini) readLoop() {
 	defer close(g.recvCh)
+	defer close(g.textCh)
 	first := true
 	for {
 		_, data, err := g.conn.Read(g.ctx)
@@ -177,8 +235,6 @@ func (g *Gemini) readLoop() {
 			return
 		}
 		if first {
-			// Reveals setupComplete (good) or an error payload (bad model name /
-			// wrong field shape) so verification problems are obvious.
 			log.Printf("gemini: first server message: %s", truncate(data, 300))
 			first = false
 		}
@@ -186,7 +242,18 @@ func (g *Gemini) readLoop() {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
-		if msg.ServerContent == nil || msg.ServerContent.ModelTurn == nil {
+		g.handleTranscription("user", msg.InputTranscription)
+		g.handleTranscription("model", msg.OutputTranscription)
+		if msg.ServerContent == nil {
+			continue
+		}
+		g.handleTranscription("user", msg.ServerContent.InputTranscription)
+		g.handleTranscription("model", msg.ServerContent.OutputTranscription)
+		if msg.ServerContent.TurnComplete {
+			g.userBuf.Reset()
+			g.modelBuf.Reset()
+		}
+		if msg.ServerContent.ModelTurn == nil {
 			continue
 		}
 		for _, part := range msg.ServerContent.ModelTurn.Parts {
@@ -197,15 +264,61 @@ func (g *Gemini) readLoop() {
 			if err != nil {
 				continue
 			}
-			rate := rateFromMime(part.InlineData.MimeType, geminiOutRate)
-			pcm := audio.ResampleLinear(bytesToPCM(raw), rate, audio.OpusRate)
+			samples := inlineAudioToModelPCM(raw, part.InlineData.MimeType)
 			select {
-			case g.recvCh <- pcm:
+			case g.recvCh <- samples:
 			case <-g.ctx.Done():
 				return
 			}
 		}
 	}
+}
+
+func (g *Gemini) handleTranscription(role string, t *geminiTranscription) {
+	if t == nil || t.Text == "" {
+		return
+	}
+	buf := &g.userBuf
+	text := t.Text
+	if role == "model" {
+		buf = &g.modelBuf
+		text = normalizeModelTranscriptionDelta(buf.Len(), text)
+	}
+	buf.WriteString(text)
+	g.emitText(role, buf.String())
+	if t.Finished {
+		buf.Reset()
+	}
+}
+
+// normalizeModelTranscriptionDelta strips a leading space from output
+// transcription deltas when Gemini tokenizes CJK one character at a time.
+// English word deltas keep their space (e.g. "Hi" + " there").
+func normalizeModelTranscriptionDelta(bufLen int, frag string) string {
+	if bufLen == 0 || !strings.HasPrefix(frag, " ") {
+		return frag
+	}
+	rest := frag[1:]
+	if rest == "" {
+		return frag
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	if isCJKTranscriptionRune(r) {
+		return rest
+	}
+	return frag
+}
+
+func isCJKTranscriptionRune(r rune) bool {
+	if unicode.Is(unicode.Han, r) {
+		return true
+	}
+	switch {
+	case r >= 0x3000 && r <= 0x303F: // CJK symbols and punctuation
+	case r >= 0xFF00 && r <= 0xFFEF: // fullwidth forms
+		return true
+	}
+	return false
 }
 
 func (g *Gemini) Close() error {

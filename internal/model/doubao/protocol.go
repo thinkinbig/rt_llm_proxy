@@ -1,4 +1,4 @@
-package model
+package doubao
 
 // Volcengine (Doubao) speech WebSocket binary V3 frame protocol, shared by the
 // ASR / TTS / realtime-dialogue products. Ported from the reference Python impl.
@@ -52,6 +52,9 @@ const (
 	dbEvSessionFailed      = 153
 	dbEvTaskRequest        = 200
 	dbEvTTSResponse        = 352 // payload is raw audio
+	dbEvASRResponse        = 451 // user speech recognition (JSON: results[].text)
+	dbEvChatResponse       = 550 // model reply text chunk (JSON: content)
+	dbEvChatEnded          = 559 // model turn complete
 )
 
 func dbIsConnectionEvent(event int32) bool {

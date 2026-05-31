@@ -3,8 +3,10 @@ module github.com/thinkinbig/rt-llm-proxy
 go 1.25.5
 
 require (
+	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/coder/websocket v1.8.14
 	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3
+	github.com/pion/interceptor v0.1.45
 	github.com/pion/webrtc/v4 v4.2.13
 	github.com/redis/go-redis/v9 v9.20.0
 )
@@ -15,7 +17,6 @@ require (
 	github.com/pion/datachannel v1.6.0 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
 	github.com/pion/ice/v4 v4.2.5 // indirect
-	github.com/pion/interceptor v0.1.45 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/mdns/v2 v2.1.0 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
@@ -28,6 +29,7 @@ require (
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/pion/turn/v5 v5.0.4 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.50.0 // indirect

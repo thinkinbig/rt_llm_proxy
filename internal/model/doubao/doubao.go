@@ -1,16 +1,19 @@
-package model
+package doubao
 
 import (
 	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +21,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/pcm"
 )
 
 // Doubao "端到端实时语音大模型" over Volcengine's binary V3 WebSocket. Voice in,
@@ -27,20 +31,34 @@ const (
 	doubaoURL          = "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"
 	doubaoPublicAppKey = "PlgvMymc7f3tQnJ6" // fixed public key for this product, not a user secret
 	doubaoInRate       = 16000
-	doubaoOutRate      = 24000
+	// Downstream TTS is 24kHz mono float32 PCM (f32le) — confirmed by dumping and
+	// analyzing the raw stream. We resample it up to the 48kHz Opus rate.
+	doubaoOutRate = 24000
 )
 
-type Doubao struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	conn     *websocket.Conn
-	writeM   sync.Mutex
-	recvCh   chan []int16
-	sid      string
-	lastSend atomic.Int64 // unix-nanos of last upstream audio, for keep-alive
+// transcript is one speech-to-text update. Text is cumulative (not a delta).
+type transcript struct {
+	Role  string // "user" or "model"
+	Text  string
+	Final bool
 }
 
-func NewDoubao(ctx context.Context) (*Doubao, error) {
+type Doubao struct {
+	ctx          context.Context
+	cancel       context.CancelFunc
+	conn         *websocket.Conn
+	writeM       sync.Mutex
+	recvCh       chan []int16
+	transcriptCh chan transcript
+	sid          string
+	lastSend     atomic.Int64 // unix-nanos of last upstream audio, for keep-alive
+
+	// Model reply text streams as deltas; accumulate so each transcript carries
+	// the full sentence so far. Reset on ChatEnded. Touched only by readLoop.
+	modelBuf strings.Builder
+}
+
+func New(ctx context.Context) (*Doubao, error) {
 	appID := os.Getenv("DOUBAO_APP_ID")
 	token := os.Getenv("DOUBAO_ACCESS_TOKEN")
 	if appID == "" || token == "" {
@@ -66,7 +84,10 @@ func NewDoubao(ctx context.Context) (*Doubao, error) {
 	}
 	conn.SetReadLimit(16 << 20)
 
-	d := &Doubao{ctx: cctx, cancel: cancel, conn: conn, recvCh: make(chan []int16, 64), sid: newUUID()}
+	d := &Doubao{
+		ctx: cctx, cancel: cancel, conn: conn,
+		recvCh: make(chan []int16, 64), transcriptCh: make(chan transcript, 64), sid: newUUID(),
+	}
 
 	if err := d.writeFrame(dbMsgFullClient, dbSerialJSON, dbEvStartConnection, gzipBytes([]byte("{}"))); err != nil {
 		d.Close()
@@ -95,10 +116,10 @@ func (d *Doubao) writeFrame(msgType, serial byte, event int32, payload []byte) e
 	return d.conn.Write(d.ctx, websocket.MessageBinary, frame)
 }
 
-func (d *Doubao) SendAudio(pcm []int16) error {
-	in := audio.ResampleLinear(pcm, audio.OpusRate, doubaoInRate)
+func (d *Doubao) SendAudio(samples []int16) error {
+	in := audio.ResampleLinear(samples, audio.OpusRate, doubaoInRate)
 	d.lastSend.Store(time.Now().UnixNano())
-	return d.writeFrame(dbMsgAudioClient, dbSerialRaw, dbEvTaskRequest, gzipBytes(pcmToBytes(in)))
+	return d.writeFrame(dbMsgAudioClient, dbSerialRaw, dbEvTaskRequest, gzipBytes(pcm.ToBytes(in)))
 }
 
 // SendText is a no-op: this is a voice-to-voice model with no text input path.
@@ -108,17 +129,111 @@ func (d *Doubao) Recv() ([]int16, error) {
 	select {
 	case <-d.ctx.Done():
 		return nil, io.EOF
-	case pcm, ok := <-d.recvCh:
+	case samples, ok := <-d.recvCh:
 		if !ok {
 			return nil, io.EOF
 		}
-		return pcm, nil
+		return samples, nil
 	}
+}
+
+func (d *Doubao) RecvTranscript() (transcript, error) {
+	select {
+	case <-d.ctx.Done():
+		return transcript{}, io.EOF
+	case t, ok := <-d.transcriptCh:
+		if !ok {
+			return transcript{}, io.EOF
+		}
+		return t, nil
+	}
+}
+
+// RecvText drains the next transcript as a "role: text" line for the data
+// channel, skipping bare final markers (empty text). Returns io.EOF on close.
+func (d *Doubao) RecvText() (string, error) {
+	for {
+		t, err := d.RecvTranscript()
+		if err != nil {
+			return "", err
+		}
+		if t.Text == "" {
+			continue
+		}
+		return t.Role + ": " + t.Text, nil
+	}
+}
+
+func (d *Doubao) emitTranscript(role, text string, final bool) {
+	if text == "" && !final {
+		return
+	}
+	select {
+	case d.transcriptCh <- transcript{Role: role, Text: text, Final: final}:
+	case <-d.ctx.Done():
+	}
+}
+
+// ASRResponse (user) and ChatResponse (model) carry the STT/text. ASR chunks
+// flip is_interim=false on the final result for an utterance; chat text streams
+// in pieces and is closed by a separate ChatEnded event.
+type doubaoASR struct {
+	Results []struct {
+		Text      string `json:"text"`
+		IsInterim bool   `json:"is_interim"`
+	} `json:"results"`
+}
+
+type doubaoChat struct {
+	Content string `json:"content"`
+}
+
+func (d *Doubao) handleASR(payload []byte) {
+	var msg doubaoASR
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return
+	}
+	for _, r := range msg.Results {
+		d.emitTranscript("user", r.Text, !r.IsInterim)
+	}
+}
+
+func (d *Doubao) handleChat(payload []byte) {
+	var msg doubaoChat
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return
+	}
+	d.modelBuf.WriteString(msg.Content)
+	d.emitTranscript("model", d.modelBuf.String(), false)
+}
+
+// ttsToModelPCM turns one TTS payload into mono s16 at 48kHz (Model contract).
+// Downstream wire format is f32le at doubaoOutRate; the server sends no per-frame
+// rate metadata, so the rate is a const shared with session start.
+func ttsToModelPCM(payload []byte) []int16 {
+	return audio.ResampleLinear(f32leToPCM(payload), doubaoOutRate, audio.OpusRate)
+}
+
+// f32leToPCM parses Doubao TTS float32 little-endian samples into s16.
+func f32leToPCM(b []byte) []int16 {
+	samples := make([]int16, len(b)/4)
+	for i := range samples {
+		f := math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+		v := float64(f) * 32767
+		switch {
+		case v > 32767:
+			v = 32767
+		case v < -32768:
+			v = -32768
+		}
+		samples[i] = int16(v)
+	}
+	return samples
 }
 
 func (d *Doubao) readLoop() {
 	defer close(d.recvCh)
-	first := true
+	defer close(d.transcriptCh)
 	for {
 		_, raw, err := d.conn.Read(d.ctx)
 		if err != nil {
@@ -129,24 +244,28 @@ func (d *Doubao) readLoop() {
 		if err != nil {
 			continue
 		}
-		if first {
-			log.Printf("doubao: first frame event=%d msgType=%d", f.event, f.msgType)
-			first = false
-		}
 		payload := f.payload
 		if f.compress == dbCompressGzip && len(payload) > 0 {
 			if dec, err := gunzipBytes(payload); err == nil {
 				payload = dec
 			}
 		}
+		dbTraceEvent(f, payload)
 		switch f.event {
 		case dbEvTTSResponse:
-			pcm := audio.ResampleLinear(bytesToPCM(payload), doubaoOutRate, audio.OpusRate)
+			samples := ttsToModelPCM(payload)
 			select {
-			case d.recvCh <- pcm:
+			case d.recvCh <- samples:
 			case <-d.ctx.Done():
 				return
 			}
+		case dbEvASRResponse:
+			d.handleASR(payload)
+		case dbEvChatResponse:
+			d.handleChat(payload)
+		case dbEvChatEnded:
+			d.emitTranscript("model", d.modelBuf.String(), true)
+			d.modelBuf.Reset()
 		case dbEvSessionFailed, dbEvConnectionFailed:
 			log.Printf("doubao: failed (event=%d): %s", f.event, string(payload))
 			return

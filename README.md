@@ -2,9 +2,7 @@
 
 Real-time LLM proxy in Go. Browsers connect over **WebRTC**; the proxy
 terminates the peer connection, decodes the Opus audio, and bridges it to a
-streaming LLM provider's WebSocket API (and back). A Go port of the ideas in
-[ggarber/rt-llm-proxy](https://github.com/ggarber/rt-llm-proxy), kept simple.
-
+streaming LLM provider's WebSocket API (and back).
 ```
 browser ──WebRTC(Opus audio + datachannel)──▶ proxy ──WebSocket(PCM)──▶ Gemini / Doubao
         ◀──────────── Opus audio ────────────         ◀──── PCM ──────
@@ -66,7 +64,10 @@ Env:
 ```
 cmd/proxy/          HTTP entrypoint, provider routing, rate-limit check
 internal/rtc/       pion WebRTC bridge: SDP offer→answer, Opus<->PCM, audio pump
-internal/model/     Model interface + gemini + doubao (both working)
+internal/model/     Model seam (interface only)
+internal/model/gemini/   Gemini Live adapter
+internal/model/doubao/    Doubao realtime dialogue adapter
+internal/model/pcm/      shared s16le serialize (uplink bytes)
 internal/audio/     Opus encode/decode (libopus) + linear resampler
 internal/ratelimit/ Redis fixed-window limiter
 demo/               minimal browser client

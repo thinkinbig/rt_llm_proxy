@@ -143,13 +143,21 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model) (string
 		trackOnce.Do(func() { go readInbound(track, m) })
 	})
 
-	// Data channel text/control -> model.
+	// Data channel: browser text -> model; model transcripts -> browser.
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if msg.IsString {
 				_ = m.SendText(string(msg.Data))
 			}
 		})
+		if t, ok := m.(transcriber); ok {
+			start := func() { go forwardTranscripts(sctx, dc, t) }
+			if dc.ReadyState() == webrtc.DataChannelStateOpen {
+				start()
+			} else {
+				dc.OnOpen(start)
+			}
+		}
 	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
@@ -216,6 +224,14 @@ func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m mo
 		log.Printf("rtc: encoder: %v", err)
 		return
 	}
+	// Pace at real time so we don't blast the browser, mirroring proxy.py. A
+	// single Ticker fires on a fixed 20ms wall clock, so per-frame encode time is
+	// absorbed instead of added on top — a per-frame time.After drifts slower
+	// than real time, backing audio up and growing end-to-end latency. During
+	// silence the extra ticks coalesce into the size-1 buffer (no burst on resume).
+	ticker := time.NewTicker(frameDur)
+	defer ticker.Stop()
+
 	var buf []int16
 	for {
 		pcm, err := m.Recv()
@@ -232,12 +248,37 @@ func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m mo
 			if err := out.WriteSample(media.Sample{Data: data, Duration: frameDur}); err != nil {
 				return
 			}
-			// Pace at real time so we don't blast the browser, mirroring proxy.py.
 			select {
-			case <-time.After(frameDur):
+			case <-ticker.C:
 			case <-ctx.Done():
 				return
 			}
+		}
+	}
+}
+
+// transcriber is the subset of models that surface speech-to-text as
+// "role: text" lines for the browser. Both Gemini and Doubao implement it.
+type transcriber interface {
+	RecvText() (string, error)
+}
+
+func forwardTranscripts(ctx context.Context, dc *webrtc.DataChannel, t transcriber) {
+	for {
+		line, err := t.RecvText()
+		if err != nil {
+			return
+		}
+		for dc.ReadyState() != webrtc.DataChannelStateOpen {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		if err := dc.SendText(line); err != nil {
+			log.Printf("rtc: transcript send: %v", err)
+			return
 		}
 	}
 }

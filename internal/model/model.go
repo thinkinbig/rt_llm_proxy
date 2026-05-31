@@ -1,9 +1,8 @@
-// Package model defines the provider-agnostic interface the WebRTC bridge talks
-// to, plus one implementation per streaming LLM provider.
+// Package model is the provider-agnostic Model seam. Concrete adapters live in
+// subpackages (gemini, doubao); the bridge and cmd/proxy depend only on Model.
 //
-// Contract: all audio crossing this interface is mono signed-16 PCM at 48kHz
-// (WebRTC's native Opus rate). Each provider resamples to/from its own rate
-// internally, so the bridge never has to know a provider's audio format.
+// Contract: all audio crossing Model is mono signed-16 PCM at 48kHz (WebRTC's
+// native Opus rate). Each adapter resamples to/from its own wire format internally.
 package model
 
 type Model interface {

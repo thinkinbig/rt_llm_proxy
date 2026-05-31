@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/doubao"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/gemini"
 	"github.com/thinkinbig/rt-llm-proxy/internal/ratelimit"
 	"github.com/thinkinbig/rt-llm-proxy/internal/rtc"
 )
@@ -71,10 +73,8 @@ func offerHandler(limiter *ratelimit.Limiter, hub *rtc.Hub) http.HandlerFunc {
 		}
 
 		ip := clientIP(r)
-		if ok, err := limiter.Allow(r.Context(), ip); err != nil {
-			http.Error(w, "rate limiter unavailable", http.StatusInternalServerError)
-			return
-		} else if !ok {
+		// Allow fails open on Redis errors (returns ok=true), so gate on ok only.
+		if ok, _ := limiter.Allow(r.Context(), ip); !ok {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -89,9 +89,9 @@ func offerHandler(limiter *ratelimit.Limiter, hub *rtc.Hub) http.HandlerFunc {
 		var m model.Model
 		switch r.URL.Query().Get("model") {
 		case "doubao":
-			m, err = model.NewDoubao(context.Background())
+			m, err = doubao.New(context.Background())
 		case "gemini", "":
-			m, err = model.NewGemini(context.Background())
+			m, err = gemini.New(context.Background())
 		default:
 			http.Error(w, "unknown model", http.StatusBadRequest)
 			return
