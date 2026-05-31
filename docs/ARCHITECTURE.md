@@ -94,11 +94,28 @@ rebuilding codec/interceptor state per session.
 
 ### 3.5 Opus tuning for lossy/quiet links  *(`audio/opus.go`, `rtc/bridge.go`)*
 
-Encoder: in-band FEC + DTX, `PacketLossPerc=10` (what actually activates FEC),
-`AppVoIP`. The answer SDP advertises
-`minptime=10;useinbandfec=1;usedtx=1;maxaveragebitrate=16000` so the **browser**
-also encodes the mic with FEC + DTX and a narrowband-ish bitrate cap. Trades a
-little fidelity for resilience and bandwidth — correct for speech.
+Opus is tuned twice — once per direction — for real-time speech over lossy
+links. Both sides trade a little fidelity for resilience and bandwidth.
+
+**Browser → proxy (mic uplink).** The answer SDP advertises this fmtp on the
+registered Opus codec (`rtc/bridge.go` → `MediaEngine`):
+
+`minptime=10;useinbandfec=1;usedtx=1;maxaveragebitrate=16000`
+
+| fmtp field | Effect |
+|---|---|
+| `minptime=10` | Allow 10ms frames — lower first-packet / short-utterance latency. |
+| `useinbandfec=1` | In-band FEC: recover partial audio from later packets after loss. |
+| `usedtx=1` | DTX: suppress full frames during silence — saves bandwidth and jitter-buffer pressure. |
+| `maxaveragebitrate=16000` | Cap average bitrate ~16 kbps — narrowband speech is enough for LLM dialogue. |
+
+The proxy decodes with a **mono** decoder (`audio/opus.go`); stereo in SDP is
+normal WebRTC negotiation and is down-mixed automatically.
+
+**Proxy → browser (model downlink).** `writeOutbound` encodes via
+`audio.NewEncoder`: `AppVoIP`, in-band FEC + DTX, and `PacketLossPerc=10`
+(what actually activates FEC on the encoder side — fmtp alone is not enough).
+Frames are 20ms / 960 samples @ 48kHz, paced by the §3.1 Ticker.
 
 ### 3.6 Non-trickle ICE, host candidates only  *(`rtc/bridge.go`, `Serve`)*
 

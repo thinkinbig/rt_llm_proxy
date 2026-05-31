@@ -250,7 +250,6 @@ func (d *Doubao) readLoop() {
 				payload = dec
 			}
 		}
-		dbTraceEvent(f, payload)
 		switch f.event {
 		case dbEvTTSResponse:
 			samples := ttsToModelPCM(payload)

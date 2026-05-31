@@ -125,7 +125,6 @@ Use an existing Secret: `--set gemini.existingSecret=my-secret` (key `GEMINI_API
 
 ## Notes / known limitations
 
-- **Audio only.** The reference also forwarded 1fps video frames; not ported.
 - **Resampling is linear interpolation.** Fine for speech at our integer ratios
   (48k↔16k, 24k→48k); swap for a polyphase filter if quality matters.
 - **Gemini WS field names are version-sensitive.** We send `realtimeInput.mediaChunks`;
