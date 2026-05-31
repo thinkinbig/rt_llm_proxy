@@ -69,9 +69,13 @@ internal/model/gemini/   Gemini Live adapter
 internal/model/doubao/    Doubao realtime dialogue adapter
 internal/model/pcm/      shared s16le serialize (uplink bytes)
 internal/audio/     Opus encode/decode (libopus) + linear resampler
-internal/ratelimit/ Redis fixed-window limiter
+internal/ratelimit/ Redis fixed-window limiter (atomic, fail-open)
 demo/               minimal browser client
+docs/               architecture & engineering notes
 ```
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module seams, the
+48kHz mono PCM audio contract, and the rationale behind each optimization.
 
 ## Docker Compose
 
@@ -128,3 +132,7 @@ Use an existing Secret: `--set gemini.existingSecret=my-secret` (key `GEMINI_API
   newer servers also accept `realtimeInput.audio`.
 - **Doubao** uses Volcengine's binary V3 framing (`wss://openspeech.bytedance.com/api/v3/realtime/dialogue`);
   payloads are gzip'd, upstream PCM is 16kHz, downstream TTS is 24kHz.
+- **Rate limiting fails open.** If Redis is unreachable the limiter allows the
+  session (and logs the error) rather than rejecting it — a Redis blip won't take
+  down the service. The counter's INCR+EXPIRE is one atomic Lua step, so a crash
+  can't strand a key without a TTL.
