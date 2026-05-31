@@ -3,8 +3,8 @@
 // ("旁路个性化推荐"). It is strictly off the real-time media path: a slow or
 // broken backend degrades the feature, never the call (ARCHITECTURE §3.3).
 //
-// The Publisher seam lets the core server stay free of any specific broker; the
-// The Tap listener (tap.go) depends only on Publisher. A nil/Nop
+// Publisher seam lets the core server stay free of any specific broker; the
+// Tap listener (tap.go) depends only on Publisher. A nil/Nop
 // publisher disables the side-channel, mirroring how an empty -redis disables
 // rate limiting.
 package sidechannel

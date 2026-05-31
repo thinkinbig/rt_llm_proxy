@@ -1,0 +1,25 @@
+package offer
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/thinkinbig/rt-llm-proxy/internal/model"
+)
+
+// ModelFactory constructs a provider Model for an offer request.
+type ModelFactory interface {
+	New(ctx context.Context, provider string) (model.Model, error)
+}
+
+// ParseProvider normalizes ?model= query values.
+func ParseProvider(raw string) (string, error) {
+	switch raw {
+	case "gemini", "":
+		return "gemini", nil
+	case "doubao", "loopback":
+		return raw, nil
+	default:
+		return "", fmt.Errorf("unknown model %q", raw)
+	}
+}

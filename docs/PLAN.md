@@ -20,18 +20,18 @@ feature, never the call.
 
 | # | Decision |
 |---|---|
-| Payload | Side-channel publishes **text transcripts** only (`SendText` in, `RecvText` out) — never audio. |
+| Payload | Side-channel publishes **text transcripts** only — never audio. Lines come from the Bridge `Recorder` via `sidechannel.Tap`. |
 | Multi-session | Upgrade `Hub` in place into a **`SessionManager`**: `session` gains `id`/`userID`/metadata/created-at; map keyed by `session_id`; lookup-by-id. |
 | Identity | `Authenticator` seam → `UserID`; default reads `Authorization: Bearer` via an injectable `TokenVerifier` (dev default). `session_id` minted server-side (UUID). |
 | Identity failure | **fail-open to anonymous** on the media path (`user_id=""`), call continues. |
 | session_id visibility | returned to browser via `X-Session-ID` response header on the SDP answer. |
-| Tap location | a **`model.Model` decorator** (`observingModel`) intercepts `SendText`/`RecvText`; the Bridge is unchanged. |
+| Tap location | Bridge **`transcript.Recorder`** is the single recording point; **`sidechannel.Tap`** implements `transcript.Listener` and publishes with the Bridge-assigned seq. |
 | Transport | **Kafka**, partition by `user_id` for in-partition ordering. |
 | Partition key | `user_id`, **falling back to `session_id` when anonymous** (avoids an anonymous hot partition). |
 | Delivery | bounded channel → async producer; **drop-on-full + `dropped_total`**; `acks=1`; **at-most-once, ordered-per-partition, lossy-under-pressure**. |
-| Publisher seam | `EventPublisher.Publish(ctx, Event) error`; default **Kafka** impl + **no-op/stdout** fallback (no broker configured ⇒ disabled, mirrors `-redis`). |
+| Publisher seam | `Publisher.Publish(ev)`; default **Kafka** impl + **no-op/stdout** fallback (no broker configured ⇒ disabled, mirrors `-redis`). |
 | Schema | **Protobuf** (`.proto` + `protoc-gen-go`, **no Schema Registry**). Fields: `schema_version,event_id,session_id,user_id,seq,role,text,ts,provider`. |
-| `seq` | per-session monotonic — lets the consumer detect the holes we drop. |
+| `seq` | **`transcript.Recorder`** assigns seq once per session; data channel, reconnect history, and Kafka events all share it. |
 | Consumer | **out of scope**; ship only a stdout demo consumer. |
 | Load test SUT | a **`loopback` fake provider** (`?model=loopback`) isolates the proxy from upstream cost/latency/limits. |
 | Load generator | **real pion headless clients**; **pre-encoded Opus replayed** to all sessions; run **off-box**; measure proxy-side resource delta via pprof/`/proc`. |
@@ -44,13 +44,13 @@ feature, never the call.
   seam + minted `session_id` + `X-Session-ID` header. No behavior change to
   media; just identity + registry.
 - [x] **P2 — Side-channel.** `event.proto` + generated Go; `Publisher`
-  seam with Nop/Stdout defaults + Kafka impl; `observing` decorator; wired in
-  `main.go` after provider construct, before `hub.Serve`; partition-key +
-  drop-on-full + `seq` + `dropped_total`; Stdout demo consumer
+  seam with Nop/Stdout defaults + Kafka impl; `sidechannel.Tap` listener on
+  Bridge `Recorder`; wired in `offer.Handler` before `hub.Serve`; partition-key +
+  drop-on-full + shared `seq` + `dropped_total`; Stdout demo consumer
   (`-sidechannel=off|stdout|kafka`).
 - [x] **P3 — Loopback provider.** `internal/model/loopback`, `?model=loopback`:
   `SendAudio` discards, `Recv` returns a looping 440Hz sine frame (paced by the
-  bridge Ticker, not silence so DTX can't suppress it), `RecvText` emits a
+  bridge Ticker, not silence so DTX can't suppress it), `RecvTranscript` emits a
   synthetic transcript every 2s.
 - [x] **P4 — Load generator + metrics.** `internal/metrics` lock-free
   frame-interval histogram instrumented in `writeOutbound`; admin listener
@@ -95,13 +95,9 @@ feature, never the call.
 
 ## Known sharp edges (don't trip on these)
 
-- **Decorator vs `transcriber` assertion.** The Bridge does
-  `m.(transcriber)` to decide whether to forward transcripts. The decorator
-  must preserve that: only wrap with a transcriber-aware variant when the inner
-  Model implements `RecvText`, otherwise the Bridge would start
-  `forwardTranscripts` on a model that has none. Pick the wrapper type at
-  construction based on the inner type — Go can't conditionally satisfy an
-  interface.
+- **`model.Transcriber` assertion.** The Bridge does `m.(model.Transcriber)` to
+  decide whether to forward STT transcripts. Providers implement
+  `RecvTranscript()` directly — no decorator wrapper needed.
 - **Anonymous hot partition** — already handled by the `session_id` fallback
   key; don't regress it by partitioning on a blank `user_id`.
 - **Generator self-cost** — if the load client re-encodes Opus per session it

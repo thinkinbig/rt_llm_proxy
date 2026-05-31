@@ -14,17 +14,20 @@ browser ──WebRTC(Opus audio + datachannel)──▶ proxy ──WebSocket(PC
   → `Model.SendAudio`. The provider adapter resamples to its own wire rate.
 - **Outbound (model → speaker):** `Model.Recv` → accumulate into a buffer →
   Opus-encode each 20ms / 960-sample frame → `WriteSample`, **paced at real time**.
-- **Data channel:** browser text → `Model.SendText`; model transcripts
-  (`RecvText`) → browser as JSON lines `{seq,role,text}` so reconnect can
-  resume from `last_seq`.
+- **Data channel:** browser typed text → `Recorder.Record("user")` + `Model.SendText`;
+  provider STT (`RecvTranscript`) → `Recorder.Record` → browser as JSON
+  `{seq,role,text}` so reconnect can resume from `last_seq`.
 
 ## 2. Modules & seams
 
 | Module | Package | Role |
 |---|---|---|
-| **Bridge** | `internal/rtc` | Terminates one browser WebRTC peer connection; pumps audio + data-channel text both ways. Talks **only** to the Model seam. |
-| **Model seam** | `internal/model` | The provider-agnostic `Model` interface (`SendAudio`/`SendText`/`Recv`/`Close`). The Bridge depends on this and nothing provider-specific. |
-| **Providers / adapters** | `internal/model/gemini`, `internal/model/doubao` | One concrete `Model` per streaming LLM. Each owns its WebSocket protocol and native audio format. Optional `transcriber` (`RecvText`) surfaces STT. |
+| **Bridge** | `internal/rtc` | Terminates one browser WebRTC peer connection; pumps audio + data-channel text both ways. Talks **only** to the Model seam. Owns the transcript **Recorder** (single recording point). |
+| **Transcript** | `internal/transcript` | Session-scoped `Line{seq,role,text}` and `Recorder` — the single seq authority shared by data channel, reconnect history, and side-channel. |
+| **Offer** | `internal/offer` | SDP offer HTTP handler: rate limit, provider routing, circuit breaker, reconnect replay resolution, then `Hub.Serve`. |
+| **Model seam** | `internal/model` | The provider-agnostic `Model` interface (`SendAudio`/`SendText`/`Recv`/`Close`). Optional `Transcriber` (`RecvTranscript`) for STT. |
+| **Providers / adapters** | `internal/model/gemini`, `internal/model/doubao` | One concrete `Model` per streaming LLM. Each owns its WebSocket protocol and native audio format. |
+| **Side-channel** | `internal/sidechannel` | `Tap` implements `transcript.Listener`; publishes `TranscriptEvent` to Kafka/stdout using the Bridge-assigned seq. |
 | **PCM helpers** | `internal/model/pcm` | `ToBytes` / `FromBytes` — s16le serialize for the uplink. Shared only because both adapters serialize contract-side s16; **not** a unified decode layer. |
 | **Audio** | `internal/audio` | Opus encode/decode (libopus via cgo) + linear resampler. |
 | **Rate limit** | `internal/ratelimit` | Redis fixed-window limiter for the SDP offer endpoint. **Control plane only.** |
@@ -144,21 +147,25 @@ good enough for speech. Swap for a polyphase filter if quality ever matters.
 - **Session outlives the request:** model connect + `Serve` use a background
   context, so the media session isn't bound to the SDP HTTP request's lifetime.
 
-### 3.9 Reconnect replay policy (best effort, bounded)  *(`cmd/proxy/main.go`, `internal/sidechannel/kafka.go`)*
+### 3.9 Reconnect replay policy (best effort, bounded)  *(`internal/offer`, `internal/sidechannel/kafka.go`)*
 
 - **Protocol:** reconnect uses `X-Replay-Version: 1`, `X-Session-ID`,
   `X-Last-Seq`; server replies with `X-Replay-Status`.
+- **Resolution:** `offer.ResolveReplay` validates headers and tries memory
+  archive first, then optional Kafka (`-replay-kafka=true`).
 - **Strict but non-blocking:** malformed `X-Last-Seq` / unsupported replay
   version returns `400`; missing id/seq simply falls back to a new session.
 - **Provider scoped:** replay only when reconnect provider matches the original
   session/provider to avoid cross-model transcript contamination.
 - **Order of sources:** memory archive first (same node), optional Kafka replay
-  second (`-replay-kafka=true`) with hard budget (`-replay-timeout`,
-  default `300ms`) and bounded lines (`-replay-limit`, default `100`).
+  second with hard budget (`-replay-timeout`, default `300ms`) and bounded
+  lines (`-replay-limit`, default `100`).
+- **Seq invariant:** `transcript.Recorder` assigns seq once; side-channel `Tap`
+  and data-channel JSON both reuse that seq (no independent counters).
 - **Invariant preserved:** replay is control-plane best effort; timeout/error
   never blocks media startup, and can be disabled globally with `-replay-kafka=false`.
 
-### 3.10 Model-connect circuit breaker  *(`cmd/proxy/main.go`, `internal/modelcb`)*
+### 3.10 Model-connect circuit breaker  *(`internal/offer`, `internal/modelcb`)*
 
 - **Scope:** only wraps provider connect (`gemini.New` / `doubao.New`) on the
   offer path. Established media sessions are unaffected.
@@ -174,5 +181,7 @@ good enough for speech. Swap for a polyphase filter if quality ever matters.
 ## 4. Tests
 
 - `internal/model/gemini`, `internal/model/doubao` — audio + transcript decode.
+- `internal/offer` — reconnect header parsing and replay resolution (table-driven).
+- `internal/transcript`, `internal/rtc` — recorder seq + listener notification.
 - `internal/ratelimit` — at-max rejection, window reset (TTL was set),
   fail-open on unreachable Redis, disabled-limiter passthrough (uses miniredis).
