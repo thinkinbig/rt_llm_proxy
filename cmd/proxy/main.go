@@ -36,6 +36,7 @@ import (
 	"github.com/thinkinbig/rt-llm-proxy/internal/ratelimit"
 	"github.com/thinkinbig/rt-llm-proxy/internal/rtc"
 	"github.com/thinkinbig/rt-llm-proxy/internal/sidechannel"
+	"github.com/thinkinbig/rt-llm-proxy/internal/transcript"
 )
 
 func main() {
@@ -325,7 +326,7 @@ func offerHandler(limiter *ratelimit.Limiter, authn *auth.Authenticator, publish
 		if replay.Enabled {
 			replayStatus = "miss"
 		}
-		var initialHistory, replayLines []rtc.TranscriptLine
+		var initialHistory, replayLines []transcript.Line
 		reqID := strings.TrimSpace(r.Header.Get("X-Session-ID"))
 		reqSeq := strings.TrimSpace(r.Header.Get("X-Last-Seq"))
 		reqReplayVersion := strings.TrimSpace(r.Header.Get("X-Replay-Version"))
@@ -393,11 +394,7 @@ func offerHandler(limiter *ratelimit.Limiter, authn *auth.Authenticator, publish
 									startSeq = lastSeq
 								}
 								for _, ev := range evs {
-									line := rtc.TranscriptLine{
-										Seq:  ev.GetSeq(),
-										Role: roleForReplay(ev.GetRole()),
-										Text: ev.GetText(),
-									}
+									line := sidechannel.LineFromEvent(ev)
 									replayLines = append(replayLines, line)
 									initialHistory = append(initialHistory, line)
 									if ev.GetSeq() > startSeq {
@@ -414,16 +411,14 @@ func offerHandler(limiter *ratelimit.Limiter, authn *auth.Authenticator, publish
 			}
 		}
 
-		// Mint/select the id here (not in Serve) so we can stamp it onto the
-		// side-channel wrapper before the bridge ever touches the model. The
-		// bridge stays oblivious to the side-channel (ARCHITECTURE §2).
-		m = sidechannel.Wrap(m, publisher, sidechannel.Meta{
+		sessionMeta := transcript.SessionMeta{
 			SessionID: sessionID, UserID: userID, Provider: provider,
-		})
+		}
 
 		answer, err := hub.Serve(context.Background(), string(body), m, rtc.SessionInfo{
 			ID: sessionID, UserID: userID, Provider: provider,
 			StartSeq: startSeq, InitialHistory: initialHistory, Replay: replayLines,
+			Transcript: sidechannel.Tap(publisher, sessionMeta),
 		})
 		if err != nil {
 			log.Printf("rtc serve: %v", err)
@@ -437,17 +432,6 @@ func offerHandler(limiter *ratelimit.Limiter, authn *auth.Authenticator, publish
 		w.Header().Set("X-Replay-Version", "1")
 		w.Header().Set("X-Replay-Status", replayStatus)
 		io.WriteString(w, answer)
-	}
-}
-
-func roleForReplay(r sidechannel.Role) string {
-	switch r {
-	case sidechannel.Role_ROLE_USER:
-		return "user"
-	case sidechannel.Role_ROLE_MODEL:
-		return "model"
-	default:
-		return "model"
 	}
 }
 

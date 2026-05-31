@@ -6,10 +6,18 @@
 package model
 
 // Transcript is one speech-to-text turn returned by a model that supports
-// transcription. Role is "user" or "model".
+// transcription. Role is "user" or "model". Seq is assigned by the Bridge
+// recorder, not by the provider.
 type Transcript struct {
 	Role string
 	Text string
+}
+
+// Transcriber is an optional Model capability: providers that surface STT
+// implement RecvTranscript. The Bridge type-asserts to this to forward
+// transcripts to the browser data channel.
+type Transcriber interface {
+	RecvTranscript() (Transcript, error)
 }
 
 type Model interface {

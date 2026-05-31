@@ -23,6 +23,7 @@ import (
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
 	"github.com/thinkinbig/rt-llm-proxy/internal/metrics"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
+	"github.com/thinkinbig/rt-llm-proxy/internal/transcript"
 )
 
 const (
@@ -46,31 +47,20 @@ type Hub struct {
 }
 
 // session is one live bridge. id is minted server-side; userID is the resolved
-// identity ("" = anonymous); both ride the side-channel events.
+// identity ("" = anonymous).
 type session struct {
 	id        string
 	userID    string
 	provider  string
 	createdAt time.Time
-	mu        sync.Mutex
-	seq       uint64
-	history   []TranscriptLine
-	histLimit int
+	rec       *transcript.Recorder
 	cleanup   func()
 }
 
 type sessionArchive struct {
 	provider string
-	history  []TranscriptLine
+	history  []transcript.Line
 	maxSeq   uint64
-}
-
-// TranscriptLine is one line exchanged on the data channel, tracked with a
-// per-session sequence so reconnect can replay missing lines.
-type TranscriptLine struct {
-	Seq  uint64 `json:"seq"`
-	Role string `json:"role"`
-	Text string `json:"text"`
 }
 
 // NewHub builds the pion API with a custom MediaEngine (Opus + our fmtp) and
@@ -120,8 +110,8 @@ func (h *Hub) add(s *session) {
 }
 
 func (h *Hub) remove(s *session) {
-	snapshot := s.snapshot(0)
-	maxSeq := s.maxSeq()
+	snapshot := s.rec.FullHistory()
+	maxSeq := s.rec.MaxSeq()
 	h.mu.Lock()
 	delete(h.conns, s.id)
 	if len(snapshot) > 0 {
@@ -144,7 +134,7 @@ func (h *Hub) Count() int {
 // Resume returns transcript lines whose seq is greater than afterSeq for a
 // known session. If the old session is still active, it is cleaned up first so
 // the reconnect owns that session id.
-func (h *Hub) Resume(sessionID, provider string, afterSeq uint64) (full, replay []TranscriptLine, startSeq uint64, ok bool) {
+func (h *Hub) Resume(sessionID, provider string, afterSeq uint64) (full, replay []transcript.Line, startSeq uint64, ok bool) {
 	if sessionID == "" {
 		return nil, nil, 0, false
 	}
@@ -173,8 +163,8 @@ func (h *Hub) Resume(sessionID, provider string, afterSeq uint64) (full, replay 
 		return nil, nil, 0, false
 	}
 	if active != nil {
-		full = active.snapshot(0)
-		startSeq = active.maxSeq()
+		full = active.rec.FullHistory()
+		startSeq = active.rec.MaxSeq()
 	} else {
 		full = slices.Clone(archived.history)
 		startSeq = archived.maxSeq
@@ -203,22 +193,21 @@ func (h *Hub) SessionState(sessionID string) (provider string, maxSeq uint64, ok
 	}
 	h.mu.Unlock()
 	if active != nil {
-		return active.provider, active.maxSeq(), true
+		return active.provider, active.rec.MaxSeq(), true
 	}
 	return "", 0, false
 }
 
 // SessionInfo is the identity the handler resolved for a new session: the
-// server-minted id, the user id ("" = anonymous), and the chosen provider. The
-// handler mints the id before Serve so it can wrap the model for the
-// side-channel; Serve only records it in the registry.
+// server-minted id, the user id ("" = anonymous), and the chosen provider.
 type SessionInfo struct {
 	ID             string
 	UserID         string
 	Provider       string
 	StartSeq       uint64
-	InitialHistory []TranscriptLine
-	Replay         []TranscriptLine
+	InitialHistory []transcript.Line
+	Replay         []transcript.Line
+	Transcript     transcript.Listener
 }
 
 // Serve sets up the peer connection for one session and returns the answer SDP.
@@ -245,14 +234,23 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info Se
 	}
 
 	sctx, scancel := context.WithCancel(ctx)
+	meta := transcript.SessionMeta{
+		SessionID: info.ID,
+		UserID:    info.UserID,
+		Provider:  info.Provider,
+	}
 	sess := &session{
 		id:        info.ID,
 		userID:    info.UserID,
 		provider:  info.Provider,
 		createdAt: time.Now(),
-		seq:       info.StartSeq,
-		history:   slices.Clone(info.InitialHistory),
-		histLimit: 256,
+		rec: transcript.NewRecorder(
+			info.StartSeq,
+			info.InitialHistory,
+			256,
+			meta,
+			info.Transcript,
+		),
 	}
 	var cleanupOnce sync.Once
 	sess.cleanup = func() {
@@ -289,11 +287,11 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info Se
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if msg.IsString {
-				sess.appendTranscript("user", string(msg.Data))
+				sess.rec.Record("user", string(msg.Data))
 				_ = m.SendText(string(msg.Data))
 			}
 		})
-		if t, ok := m.(transcriber); ok {
+		if t, ok := m.(model.Transcriber); ok {
 			start := func() {
 				replayOnce.Do(func() { sendReplay(dc, info.Replay) })
 				go forwardTranscripts(sctx, dc, t, sess)
@@ -409,19 +407,13 @@ func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m mo
 	}
 }
 
-// transcriber is the subset of models that surface speech-to-text as
-// model.Transcript values for the browser. Both Gemini and Doubao implement it.
-type transcriber interface {
-	RecvTranscript() (model.Transcript, error)
-}
-
-func forwardTranscripts(ctx context.Context, dc *webrtc.DataChannel, t transcriber, sess *session) {
+func forwardTranscripts(ctx context.Context, dc *webrtc.DataChannel, t model.Transcriber, sess *session) {
 	for {
 		tr, err := t.RecvTranscript()
 		if err != nil {
 			return
 		}
-		ev := sess.appendTranscript(tr.Role, tr.Text)
+		line := sess.rec.Record(tr.Role, tr.Text)
 		for dc.ReadyState() != webrtc.DataChannelStateOpen {
 			select {
 			case <-ctx.Done():
@@ -429,53 +421,23 @@ func forwardTranscripts(ctx context.Context, dc *webrtc.DataChannel, t transcrib
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
-		if err := dc.SendText(marshalTranscript(ev)); err != nil {
+		if err := dc.SendText(marshalLine(line)); err != nil {
 			log.Printf("rtc: transcript send: %v", err)
 			return
 		}
 	}
 }
 
-func sendReplay(dc *webrtc.DataChannel, replay []TranscriptLine) {
+func sendReplay(dc *webrtc.DataChannel, replay []transcript.Line) {
 	for _, line := range replay {
-		if err := dc.SendText(marshalTranscript(line)); err != nil {
+		if err := dc.SendText(marshalLine(line)); err != nil {
 			log.Printf("rtc: transcript replay send: %v", err)
 			return
 		}
 	}
 }
 
-func marshalTranscript(line TranscriptLine) string {
+func marshalLine(line transcript.Line) string {
 	b, _ := json.Marshal(line)
 	return string(b)
-}
-
-func (s *session) appendTranscript(role, text string) TranscriptLine {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.seq++
-	line := TranscriptLine{Seq: s.seq, Role: role, Text: text}
-	s.history = append(s.history, line)
-	if extra := len(s.history) - s.histLimit; extra > 0 {
-		s.history = append([]TranscriptLine(nil), s.history[extra:]...)
-	}
-	return line
-}
-
-func (s *session) snapshot(afterSeq uint64) []TranscriptLine {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]TranscriptLine, 0, len(s.history))
-	for _, line := range s.history {
-		if line.Seq > afterSeq {
-			out = append(out, line)
-		}
-	}
-	return out
-}
-
-func (s *session) maxSeq() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.seq
 }

@@ -7,8 +7,8 @@ option go_package = "github.com/thinkinbig/rt-llm-proxy/internal/sidechannel";
 // Role distinguishes who produced the text of a TranscriptEvent.
 enum Role {
   ROLE_UNSPECIFIED = 0;
-  ROLE_USER = 1;   // browser -> model (SendText)
-  ROLE_MODEL = 2;  // model -> browser (RecvText)
+  ROLE_USER = 1;   // user transcript (typed or STT)
+  ROLE_MODEL = 2;  // model transcript (STT)
 }
 
 // TranscriptEvent is one transcript line tapped off the media bridge and

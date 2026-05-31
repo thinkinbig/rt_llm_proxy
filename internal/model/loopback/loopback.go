@@ -31,7 +31,7 @@ const (
 type Model struct {
 	tone   []int16
 	pos    int // Recv goroutine only
-	n      int // RecvText goroutine only
+	n      int // RecvTranscript goroutine only
 	closed chan struct{}
 }
 

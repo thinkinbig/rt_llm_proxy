@@ -4,7 +4,7 @@
 // broken backend degrades the feature, never the call (ARCHITECTURE §3.3).
 //
 // The Publisher seam lets the core server stay free of any specific broker; the
-// observing decorator (observing.go) depends only on Publisher. A nil/Nop
+// The Tap listener (tap.go) depends only on Publisher. A nil/Nop
 // publisher disables the side-channel, mirroring how an empty -redis disables
 // rate limiting.
 package sidechannel
