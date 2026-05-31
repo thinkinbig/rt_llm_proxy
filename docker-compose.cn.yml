@@ -1,0 +1,7 @@
+# China / blocked proxy.golang.org: use goproxy.cn for `go mod download` in the image build.
+#   docker compose -f docker-compose.yml -f docker-compose.cn.yml up --build
+services:
+  proxy:
+    build:
+      args:
+        GOPROXY: https://goproxy.cn,direct

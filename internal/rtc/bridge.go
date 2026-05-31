@@ -19,6 +19,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/metrics"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 )
 
@@ -31,14 +32,23 @@ const (
 	opusFmtp = "minptime=10;useinbandfec=1;usedtx=1;maxaveragebitrate=16000"
 )
 
-// Hub holds the shared WebRTC API and the set of active sessions.
+// Hub holds the shared WebRTC API and the registry of active sessions, keyed by
+// server-minted session id. It doubles as the SessionManager.
 type Hub struct {
 	api   *webrtc.API
 	mu    sync.Mutex
-	conns map[*session]struct{}
+	conns map[string]*session
 }
 
-type session struct{ cleanup func() }
+// session is one live bridge. id is minted server-side; userID is the resolved
+// identity ("" = anonymous); both ride the side-channel events.
+type session struct {
+	id        string
+	userID    string
+	provider  string
+	createdAt time.Time
+	cleanup   func()
+}
 
 // NewHub builds the pion API with a custom MediaEngine (Opus + our fmtp) and
 // the default interceptors.
@@ -60,14 +70,14 @@ func NewHub() (*Hub, error) {
 		return nil, err
 	}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir))
-	return &Hub{api: api, conns: make(map[*session]struct{})}, nil
+	return &Hub{api: api, conns: make(map[string]*session)}, nil
 }
 
 // CloseAll tears down every active session (used on graceful shutdown).
 func (h *Hub) CloseAll() {
 	h.mu.Lock()
 	snapshot := make([]*session, 0, len(h.conns))
-	for s := range h.conns {
+	for _, s := range h.conns {
 		snapshot = append(snapshot, s)
 	}
 	h.mu.Unlock()
@@ -78,20 +88,37 @@ func (h *Hub) CloseAll() {
 
 func (h *Hub) add(s *session) {
 	h.mu.Lock()
-	h.conns[s] = struct{}{}
+	h.conns[s.id] = s
 	h.mu.Unlock()
 }
 
 func (h *Hub) remove(s *session) {
 	h.mu.Lock()
-	delete(h.conns, s)
+	delete(h.conns, s.id)
 	h.mu.Unlock()
+}
+
+// Count returns the number of live sessions (load-test observability).
+func (h *Hub) Count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.conns)
+}
+
+// SessionInfo is the identity the handler resolved for a new session: the
+// server-minted id, the user id ("" = anonymous), and the chosen provider. The
+// handler mints the id before Serve so it can wrap the model for the
+// side-channel; Serve only records it in the registry.
+type SessionInfo struct {
+	ID       string
+	UserID   string
+	Provider string
 }
 
 // Serve sets up the peer connection for one session and returns the answer SDP.
 // Media bridging runs in background goroutines that tear down when the
 // connection drops, the model session ends, or the hub is closed.
-func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model) (string, error) {
+func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info SessionInfo) (string, error) {
 	pc, err := h.api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return "", err
@@ -112,7 +139,7 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model) (string
 	}
 
 	sctx, scancel := context.WithCancel(ctx)
-	sess := &session{}
+	sess := &session{id: info.ID, userID: info.UserID, provider: info.Provider, createdAt: time.Now()}
 	var cleanupOnce sync.Once
 	sess.cleanup = func() {
 		cleanupOnce.Do(func() {
@@ -233,6 +260,7 @@ func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m mo
 	defer ticker.Stop()
 
 	var buf []int16
+	var last time.Time // wall clock of the previous frame emission
 	for {
 		pcm, err := m.Recv()
 		if err != nil {
@@ -248,6 +276,12 @@ func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m mo
 			if err := out.WriteSample(media.Sample{Data: data, Duration: frameDur}); err != nil {
 				return
 			}
+			// Record the realized emission cadence (the §3.1 pacing SLO).
+			now := time.Now()
+			if !last.IsZero() {
+				metrics.ObserveFrameInterval(now.Sub(last))
+			}
+			last = now
 			select {
 			case <-ticker.C:
 			case <-ctx.Done():

@@ -1,0 +1,4 @@
+n,proxy_cpu_pct,total_frames,ge30ms_count,ge30ms_pct,connected,goroutines
+50,328,12208,318,2.6,50,7
+150,749,24441,6787,27.8,145,2043
+300,706,26546,10726,40.4,236,17812

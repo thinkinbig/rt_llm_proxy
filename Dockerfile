@@ -1,8 +1,10 @@
 FROM golang:1.25-bookworm AS build
 
-# proxy.golang.org often times out in Docker builds; override if needed:
-#   docker build --build-arg GOPROXY=https://proxy.golang.org,direct .
-ARG GOPROXY=https://goproxy.cn,direct
+# Docker: use goproxy.io (proxy.golang.org often TLS-times out in containers; Go does
+# not fall through to the next entry on proxy network errors).
+# China: docker compose -f docker-compose.yml -f docker-compose.cn.yml build
+# Host dev abroad: go env -w GOPROXY=https://proxy.golang.org,direct
+ARG GOPROXY=https://goproxy.io,direct
 ENV GOPROXY=${GOPROXY}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -11,10 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /proxy ./cmd/proxy
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /proxy ./cmd/proxy
 
 FROM debian:bookworm-slim
 

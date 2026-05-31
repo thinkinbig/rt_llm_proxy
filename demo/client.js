@@ -39,7 +39,7 @@ function setStatus(state, text, hint) {
 }
 
 function updateTranscriptBadge(model) {
-  const names = { gemini: 'Gemini', doubao: '豆包' };
+  const names = { gemini: 'Gemini', doubao: '豆包', loopback: 'Loopback' };
   const name = names[model];
   const on = !!name;
   transcriptBadge.textContent = on ? name : '暂不支持';

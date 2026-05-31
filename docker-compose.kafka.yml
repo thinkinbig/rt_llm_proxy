@@ -1,0 +1,52 @@
+# Optional overlay: bring up a single-node KRaft Kafka and point the proxy's
+# transcript side-channel at it. NOT needed for the proxy itself or for capacity
+# benchmarks (run those with -sidechannel=off) — this only exercises the Kafka
+# publish path end to end.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.kafka.yml up --build
+#
+# Inspect the events:
+#   docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+#     --bootstrap-server localhost:9092 --topic transcripts --from-beginning
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # 3 partitions so the user_id partition key actually demonstrates ordering.
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  proxy:
+    # Override replaces the base command list, so redis flags are repeated here.
+    command:
+      - -addr
+      - :8080
+      - -redis
+      - redis:6379
+      - -sidechannel
+      - kafka
+      - -kafka
+      - kafka:9092
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy

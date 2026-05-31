@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package sidechannel;
+
+option go_package = "github.com/thinkinbig/rt-llm-proxy/internal/sidechannel";
+
+// Role distinguishes who produced the text of a TranscriptEvent.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_USER = 1;   // browser -> model (SendText)
+  ROLE_MODEL = 2;  // model -> browser (RecvText)
+}
+
+// TranscriptEvent is one transcript line tapped off the media bridge and
+// published to the side-channel for personalization. It never carries audio.
+//
+// Delivery is at-most-once and lossy under pressure (see ARCHITECTURE /
+// docs/PLAN.md): `seq` is monotonic per session so a consumer can detect the
+// gaps we drop.
+message TranscriptEvent {
+  uint32 schema_version = 1; // 1
+  string event_id = 2;       // uuid, for consumer-side idempotent dedup
+  string session_id = 3;     // server-minted, also the partition key fallback
+  string user_id = 4;        // "" = anonymous
+  uint64 seq = 5;            // monotonic within a session; gap = dropped events
+  Role role = 6;
+  string text = 7;
+  int64 ts = 8;             // unix milliseconds
+  string provider = 9;      // "gemini" | "doubao" | "loopback"
+}
