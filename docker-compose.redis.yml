@@ -1,0 +1,26 @@
+# Optional overlay: SDP offer rate limiting via Redis (same as `go run` with -redis).
+#   docker compose -f docker-compose.yml -f docker-compose.redis.yml up --build
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  proxy:
+    # Override replaces the base command list.
+    command:
+      - -addr
+      - :8080
+      - -redis
+      - redis:6379
+      - -rl-max
+      - "10"
+      - -rl-window
+      - 1m
+    depends_on:
+      redis:
+        condition: service_healthy
