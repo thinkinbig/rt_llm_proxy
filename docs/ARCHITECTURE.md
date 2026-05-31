@@ -122,8 +122,9 @@ Frames are 20ms / 960 samples @ 48kHz, paced by the §3.1 Ticker.
 `Serve` waits on `GatheringCompletePromise` and returns the **full** answer SDP
 with candidates (non-trickle). No STUN/TURN/SFU (`iceServers=[]`). The proxy is
 intentionally **not** NAT-traversal infrastructure — simpler signaling, fewer
-moving parts. Tradeoff: media won't traverse cluster NAT (see README's Helm
-warning); run the container on a host the browser can reach directly.
+moving parts. Tradeoff: media won't traverse cluster NAT; horizontal scale and
+failover are partial by design (L1–L4 — see README's "Scaling & failover").
+Run the container on a host the browser can reach directly.
 
 ### 3.7 Linear resampling at integer ratios  *(`audio/resample.go`)*
 

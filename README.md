@@ -93,7 +93,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module seams, the
 
 ## Docker Compose
 
-Proxy + Redis (SDP rate limiting). Copy env and start:
+Minimal stack: **proxy only** (no Redis, no Kafka — mirrors `go run` defaults).
+Copy env and start:
 
 ```bash
 cp .env.example .env   # set GEMINI_API_KEY
@@ -101,7 +102,21 @@ docker compose up --build          # Docker: goproxy.io (default)
 # http://localhost:8080/demo/
 ```
 
-**China** — `proxy.golang.org` / `goproxy.io` slow in Docker; use the CN overlay
+Optional overlays (same `-f` pattern for each):
+
+| Overlay | What it adds |
+|---|---|
+| `docker-compose.redis.yml` | Redis + SDP offer rate limiting (`-redis`) |
+| `docker-compose.kafka.yml` | Kafka + transcript side-channel (`-sidechannel=kafka`) |
+| `docker-compose.redis-kafka.yml` | Both (use this instead of stacking redis + kafka) |
+| `docker-compose.cn.yml` | `goproxy.cn` for the image build |
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.redis.yml up --build
+docker compose -f docker-compose.yml -f docker-compose.kafka.yml up --build
+```
+
+**China** — `proxy.golang.org` / `goproxy.io` slow in Docker; add the CN overlay
 or set `GOPROXY` in `.env`:
 
 ```bash
@@ -109,38 +124,46 @@ docker compose -f docker-compose.yml -f docker-compose.cn.yml up --build
 # or: GOPROXY=https://goproxy.cn,direct docker compose up --build
 ```
 
-Without Redis:
+## Scaling & failover
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.no-redis.yml up --build
-```
+This proxy is **single reachable host / vertical scaling** — it is not built for
+Kubernetes horizontal scaling, and failover is partial by nature. The honest
+picture, and what we already have toward it:
 
-## Kubernetes (Helm)
+**Why it's hard (shared-nothing ≠ disaster recovery).** Shared-nothing buys
+horizontal scale and fault isolation, not state recovery. A realtime session has
+strong *state affinity*: the WebRTC/WebSocket connection lives on one pod's
+kernel fds and its state (pion peer connection, provider WebSocket, conversation
+context, encoder, jitter buffers) lives in that pod's memory. Another pod cannot
+inherit the fd, so **seamless connection migration (L4) is impractical.** Media
+is also UDP straight to the pod, and managed-cluster node IPs are private/NAT'd —
+so `hostNetwork`/`replicas: N` don't make media work; that needs a TURN relay.
 
-Chart at `deploy/helm/rt-llm-proxy` — deploys the proxy plus an in-cluster **Redis**
-for SDP offer rate limiting (`redis.enabled`, on by default).
+**Failover levels** (most realtime systems aim for L2–L3, not L4):
 
-> ⚠️ **WebRTC media will not traverse cluster NAT.** The proxy gathers host ICE
-> candidates only (pod IP), and the Service exposes just the TCP signaling port —
-> so the SDP exchange and demo page work, but audio never connects. This chart is
-> intentionally kept free of `hostNetwork`/TURN workarounds; for working media run
-> the container on a host the browser can reach directly (see Docker Compose).
+| Level | Goal | Status here |
+|---|---|---|
+| L1 | server dies → client reconnects, service stays up | reachable once replicated behind TURN |
+| L2 | reconnect restores the *session* | **half-built** — server-minted `session_id` exists; needs a client reconnect protocol + server-side session lookup |
+| L3 | reconnect resumes *progress* | **half-built** — the Kafka side-channel is a replayable event log with a per-session `seq`; a new pod could resume from `session_id`+`last_seq` |
+| L4 | near-seamless connection migration | impractical (fd/media affinity) — don't chase it |
 
-```bash
-# build image and load into Minikube
-docker build -t rt-llm-proxy:latest .
-minikube image load rt-llm-proxy:latest
+So it's **not "can't be done"** — the design already leans the right way: the
+proxy is thin (state behind the `Model` seam), key events are externalized to a
+replayable Kafka log keyed by `user_id` with a monotonic `seq`, and `session_id`
+is server-minted. What's missing for L2/L3 is a **client reconnect protocol** and
+**server-side context restore from `session_id`+`last_seq`**. The hard caveat:
+the *provider's* dialogue context (Gemini/Doubao) lives in their server-side
+socket, so we can restore our session metadata and transcribed text, but cannot
+guarantee the upstream model resumes mid-thought.
 
-helm upgrade --install rt-llm-proxy deploy/helm/rt-llm-proxy \
-  --set gemini.apiKey="$GEMINI_API_KEY"
-
-# demo UI (NodePort 30080 by default)
-echo "http://$(minikube ip):30080/demo/"
-```
-
-Disable Redis: `--set redis.enabled=false` (proxy runs without `-redis`, same as local).
-
-Use an existing Secret: `--set gemini.existingSecret=my-secret` (key `GEMINI_API_KEY`).
+**For production scale today, front it with a mature media layer** — coturn
+(TURN) for reachability and an SFU / realtime-agent framework (LiveKit, Pipecat)
+for horizontal scale, session routing, and reconnect. Note it's 1:1
+(browser↔LLM), so a pure SFU's selective forwarding isn't the need —
+reachability + scale/routing is. Building an SFU/TURN into this repo was
+deliberately **not** done. What scales unchanged today: Redis rate limiting
+(shared across replicas) and the Kafka side-channel (off the media path).
 
 ## Notes / known limitations
 

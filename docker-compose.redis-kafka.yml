@@ -1,0 +1,27 @@
+# Optional overlay: Redis rate limiting + Kafka side-channel together.
+# Stacking redis.yml and kafka.yml does not merge proxy command lists — use this.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.redis-kafka.yml up --build
+include:
+  - docker-compose.redis.yml
+  - docker-compose.kafka.yml
+services:
+  proxy:
+    command:
+      - -addr
+      - :8080
+      - -redis
+      - redis:6379
+      - -rl-max
+      - "10"
+      - -rl-window
+      - 1m
+      - -sidechannel
+      - kafka
+      - -kafka
+      - kafka:9092
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
