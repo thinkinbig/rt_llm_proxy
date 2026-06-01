@@ -118,7 +118,7 @@ the call proceeds.
 | Control | `auth` | missing / invalid token | **Anonymous** `user_id=""` | No |
 | Control | `modelcb` | circuit open / half-open gated | `503` + `Retry-After` | Yes (offer only) |
 | Control | `modelcb` | N connect failures / auth error | Open per provider | Yes (offer only) |
-| Control | `modelcb` | stream error before first audio (within 10s) | `OnModelFault` → `Record` | No (existing sessions continue) |
+| Control | `modelcb` | stream error before first audio (within 10s) | `StreamFaultAt` → `RecordStreamFault` | No (existing sessions continue) |
 | Control | `ResolveReplay` | timeout / miss / disabled | `X-Replay-Status` degrade | No |
 | Side | `sidechannel` / Kafka | buffer full / closed | **Drop** + `dropped_total` | No |
 | Data | `rtc.Bridge` | provider silence | Ticker coalesces ticks (no burst) | No |
@@ -155,9 +155,11 @@ Failover levels (L1–L4) and production scaling notes live in
 | Module | Package | Role |
 |---|---|---|
 | **Bridge** | `internal/rtc` | Terminates one browser WebRTC peer connection; pumps audio + data-channel text both ways. Talks **only** to the Model seam. Owns the transcript **Recorder** (single recording point). |
+| **Session archive** | `internal/rtc` (`sessionArchiveStore`) | In-memory reconnect archive for disconnected sessions with TTL + ownership checks; used by `Resume`/`SessionState`. |
 | **Transcript** | `internal/transcript` | Session-scoped `Line{seq,role,text}` and `Recorder` — the single seq authority shared by data channel, reconnect history, and side-channel. |
-| **Offer** | `internal/offer` | SDP offer HTTP handler: rate limit, auth, circuit breaker, reconnect replay resolution, then `Hub.Serve`. |
-| **Circuit breaker** | `internal/modelcb` | Per-provider breaker on model connect (+ early stream faults via `OnModelFault`). |
+| **Session offer intake** | `internal/offer` (`Intake`) | Control-plane chain: rate limit, provider guard, reconnect replay, then `Hub.Serve`. |
+| **Offer HTTP adapter** | `internal/offer` (`Handler`) | Maps POST / to `Intake.ServeOffer`. |
+| **Provider guard** | `internal/modelcb` | Per-provider circuit: `AllowDial` / `RecordDial` on offer; early stream faults via `StreamFaultAt` on the Bridge. |
 | **Auth** | `internal/auth` | Bearer → `user_id` on the offer path; fail-open anonymous. |
 | **Adaptive** | `internal/adaptive` | Optional Opus encode-complexity controller under load (`-adaptive`). |
 | **Model seam** | `internal/model` | The provider-agnostic `Model` interface (`SendAudio`/`SendText`/`Recv`/`Close`). Optional `Transcriber` (`RecvTranscript`) for STT. |
@@ -166,6 +168,7 @@ Failover levels (L1–L4) and production scaling notes live in
 | **PCM helpers** | `internal/model/pcm` | `ToBytes` / `FromBytes` — s16le serialize for the uplink. Shared only because both adapters serialize contract-side s16; **not** a unified decode layer. |
 | **Audio** | `internal/audio` | Opus encode/decode (libopus via cgo) + linear resampler. |
 | **Rate limit** | `internal/ratelimit` | Redis fixed-window limiter for the SDP offer endpoint. **Control plane only.** |
+| **Composition root** | `cmd/proxy` (`runProxy`) | Wires runtime adapters from config and owns process shutdown ordering. |
 
 ### The audio contract (load-bearing)
 
@@ -300,22 +303,26 @@ good enough for speech. Swap for a polyphase filter if quality ever matters.
 - **Invariant preserved:** replay is control-plane best effort; timeout/error
   never blocks media startup, and can be disabled globally with `-replay-kafka=false`.
 
-### 3.10 Model circuit breaker  *(`internal/offer`, `internal/modelcb`, `rtc/bridge.go`)*
+### 3.10 Provider guard  *(`internal/modelcb`, `internal/offer/intake.go`, `rtc/bridge.go`)*
 
-- **Scope:** gates **new** dials on the offer path (`gemini.New` / `doubao.New`).
-  Established media sessions are unaffected once connected.
+- **Scope:** gates **new** dials on the offer path (`AllowDial` before
+  `Models.New`). Established media sessions are unaffected once connected.
 - **Policy:** fail with `503` when circuit is open/half-open gated, with
   `Retry-After`, `X-Model-CB-State`, `X-Model-CB-Reason`.
 - **State machine:** `closed -> open -> half_open -> closed`; half-open allows
   a single probe request at a time per provider.
-- **Error sensitivity:** auth-class failures (`401/403`, unauthorized/forbidden)
-  open immediately with a longer hold (`-model-cb-auth-open-for`, default 5m);
-  transient failures open after `-model-cb-open-after` consecutive misses.
+- **Error sensitivity:** auth-class dial failures (`401/403`,
+  unauthorized/forbidden) open immediately with a longer hold
+  (`-model-cb-auth-open-for`, default 5m). Non-auth dial failures open after
+  `-model-cb-open-after` consecutive dial misses.
+- **Recovery:** a successful dial (`RecordDial(nil)`) resets both dial and early
+  stream failure streaks for that provider.
 - **Early stream fault:** if the provider WebSocket connects but `Recv` errors
-  before any audio within `earlyFaultWindow` (10s), `writeOutbound` calls
-  `OnModelFault` → `Breakers.Record` — catches "connected but dead on arrival"
-  without waiting for N separate offer failures.
+  before any audio within `modelcb.EarlyFaultWindow` (10s), `writeOutbound`
+  reports via `StreamFaultAt` → `RecordStreamFault` — catches "connected but dead
+  on arrival". Early stream failures are counted separately from dial failures.
 - **Isolation:** breakers are per provider, with optional per-provider overrides.
+  Loopback and a nil manager skip all guard logic.
 
 ### 3.11 Adaptive Opus complexity  *(`internal/adaptive`, `internal/audio/opus.go`)*
 
@@ -332,7 +339,9 @@ path and can only mis-pick quality, never stall a session.
 ## 4. Tests
 
 - `internal/model/gemini`, `internal/model/doubao` — audio + transcript decode.
-- `internal/offer` — reconnect header parsing and replay resolution (table-driven).
+- `internal/offer` — session offer intake (rate limit, guard, model lifecycle) and
+  reconnect replay resolution (table-driven).
+- `internal/modelcb` — provider guard dial + early stream fault policy.
 - `internal/transcript`, `internal/rtc` — recorder seq + listener notification.
 - `internal/ratelimit` — at-max rejection, window reset (TTL was set),
   fail-open on unreachable Redis, disabled-limiter passthrough (uses miniredis).

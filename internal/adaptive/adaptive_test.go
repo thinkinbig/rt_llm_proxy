@@ -2,7 +2,9 @@ package adaptive
 
 import (
 	"math"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSessionHysteresis(t *testing.T) {
@@ -75,5 +77,21 @@ func TestRecentDrift(t *testing.T) {
 	}
 	if d := recentDrift(cur, cur); d != 0 {
 		t.Errorf("no traffic -> drift 0, got %v", d)
+	}
+}
+
+// Close must be idempotent: a second (or concurrent) call neither panics nor
+// blocks. Run with -race to also catch a double close(stop).
+func TestControllerCloseIdempotent(t *testing.T) {
+	noop := func(int) {}
+	session := NewSession(func() int { return 0 }, noop, []int{10, 5}, []int{40}, []int{30}, time.Hour)
+	drift := NewDrift(func() map[string]uint64 { return nil }, noop, []int{10, 5}, 0.1, 0.03, 1, time.Hour)
+
+	for _, c := range []interface{ Close() }{session, drift} {
+		var wg sync.WaitGroup
+		for range 3 {
+			wg.Go(c.Close)
+		}
+		wg.Wait()
 	}
 }

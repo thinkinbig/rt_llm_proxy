@@ -5,6 +5,22 @@ import (
 	"time"
 )
 
+func TestOutboundMediaStats(t *testing.T) {
+	RecordOutboundFrameWritten()
+	RecordOutboundFrameWritten()
+	RecordOutboundPumpExit("write_sample")
+	RecordOutboundPumpExit("recv")
+	RecordOutboundPumpExit("ctx")
+
+	s := OutboundMediaStats()
+	if s["frames_written"] != 2 {
+		t.Fatalf("frames_written = %d, want 2", s["frames_written"])
+	}
+	if s["pump_exit_write_sample"] != 1 || s["pump_exit_recv"] != 1 || s["pump_exit_ctx"] != 1 {
+		t.Fatalf("pump exits = %+v", s)
+	}
+}
+
 func TestObserveFrameIntervalBuckets(t *testing.T) {
 	ObserveFrameInterval(19 * time.Millisecond)                      // <20ms
 	ObserveFrameInterval(20*time.Millisecond + 500*time.Microsecond) // 20-21ms

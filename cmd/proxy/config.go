@@ -1,0 +1,99 @@
+package main
+
+import (
+	"flag"
+	"time"
+
+	"github.com/thinkinbig/rt-llm-proxy/internal/modelcb"
+)
+
+type runConfig struct {
+	Addr      string
+	AdminAddr string
+
+	RedisAddr string
+	RLMax     int
+	RLWindow  time.Duration
+	TrustProxy bool
+
+	SidechannelMode string
+	KafkaBrokers    string
+	KafkaTopic      string
+
+	ReplayKafka   bool
+	ReplayTimeout time.Duration
+	ReplayLimit   int
+
+	ModelCBEnable bool
+	ModelCB       modelCBConfigArgs
+
+	OpusComplexity int
+	AdaptiveMode   string
+}
+
+func parseFlags() runConfig {
+	addr := flag.String("addr", ":8080", "listen address")
+	redisAddr := flag.String("redis", "", "redis address for rate limiting (empty = disabled)")
+	rlMax := flag.Int("rl-max", 10, "max sessions per client per window")
+	rlWindow := flag.Duration("rl-window", time.Minute, "rate limit window")
+	trustProxy := flag.Bool("trust-proxy", false, "trust X-Forwarded-For for the rate-limit client IP (enable only behind a reverse proxy that sets it)")
+	scMode := flag.String("sidechannel", "off", "transcript side-channel: off|stdout|kafka")
+	kafkaBrokers := flag.String("kafka", "", "kafka seed brokers (csv) for -sidechannel=kafka")
+	kafkaTopic := flag.String("kafka-topic", "transcripts", "kafka topic for transcript events")
+	replayKafka := flag.Bool("replay-kafka", false, "enable best-effort cross-node replay from Kafka on reconnect")
+	replayTimeout := flag.Duration("replay-timeout", 300*time.Millisecond, "replay timeout budget when -replay-kafka=true")
+	replayLimit := flag.Int("replay-limit", 100, "max replay transcript lines on reconnect")
+	modelCBEnable := flag.Bool("model-cb", true, "enable model connect circuit breaker")
+	modelCBOpenAfter := flag.Int("model-cb-open-after", 5, "consecutive failures before opening model circuit")
+	modelCBOpenFor := flag.Duration("model-cb-open-for", 30*time.Second, "open-state duration for transient model failures")
+	modelCBHalfOpenSuccess := flag.Int("model-cb-half-open-success", 3, "successful half-open probes required to close model circuit")
+	modelCBAuthOpenFor := flag.Duration("model-cb-auth-open-for", 5*time.Minute, "open-state duration for auth failures (401/403)")
+	modelCBOpenAfterGemini := flag.Int("model-cb-open-after-gemini", 0, "override model-cb-open-after for gemini (0 = default)")
+	modelCBOpenForGemini := flag.Duration("model-cb-open-for-gemini", 0, "override model-cb-open-for for gemini (0 = default)")
+	modelCBHalfOpenSuccessGemini := flag.Int("model-cb-half-open-success-gemini", 0, "override model-cb-half-open-success for gemini (0 = default)")
+	modelCBAuthOpenForGemini := flag.Duration("model-cb-auth-open-for-gemini", 0, "override model-cb-auth-open-for for gemini (0 = default)")
+	modelCBOpenAfterDoubao := flag.Int("model-cb-open-after-doubao", 0, "override model-cb-open-after for doubao (0 = default)")
+	modelCBOpenForDoubao := flag.Duration("model-cb-open-for-doubao", 0, "override model-cb-open-for for doubao (0 = default)")
+	modelCBHalfOpenSuccessDoubao := flag.Int("model-cb-half-open-success-doubao", 0, "override model-cb-half-open-success for doubao (0 = default)")
+	modelCBAuthOpenForDoubao := flag.Duration("model-cb-auth-open-for-doubao", 0, "override model-cb-auth-open-for for doubao (0 = default)")
+	adminAddr := flag.String("admin", "", "admin listen address for /stats + /debug/pprof (empty = off)")
+	opusComplexity := flag.Int("opus-complexity", -1, "Opus encoder complexity 0-10 (-1 = libopus default; lower = less CPU)")
+	adaptiveMode := flag.String("adaptive", "off", "adaptive Opus complexity under load: off|sessions|drift")
+	flag.Parse()
+
+	return runConfig{
+		Addr:            *addr,
+		AdminAddr:       *adminAddr,
+		RedisAddr:       *redisAddr,
+		RLMax:           *rlMax,
+		RLWindow:        *rlWindow,
+		TrustProxy:      *trustProxy,
+		SidechannelMode: *scMode,
+		KafkaBrokers:    *kafkaBrokers,
+		KafkaTopic:      *kafkaTopic,
+		ReplayKafka:     *replayKafka,
+		ReplayTimeout:   *replayTimeout,
+		ReplayLimit:     *replayLimit,
+		ModelCBEnable:   *modelCBEnable,
+		ModelCB: modelCBConfigArgs{
+			OpenAfter:       *modelCBOpenAfter,
+			OpenFor:         *modelCBOpenFor,
+			HalfOpenSuccess: *modelCBHalfOpenSuccess,
+			AuthOpenFor:     *modelCBAuthOpenFor,
+			Gemini: modelcb.Config{
+				OpenAfter:       *modelCBOpenAfterGemini,
+				OpenFor:         *modelCBOpenForGemini,
+				HalfOpenSuccess: *modelCBHalfOpenSuccessGemini,
+				AuthOpenFor:     *modelCBAuthOpenForGemini,
+			},
+			Doubao: modelcb.Config{
+				OpenAfter:       *modelCBOpenAfterDoubao,
+				OpenFor:         *modelCBOpenForDoubao,
+				HalfOpenSuccess: *modelCBHalfOpenSuccessDoubao,
+				AuthOpenFor:     *modelCBAuthOpenForDoubao,
+			},
+		},
+		OpusComplexity: *opusComplexity,
+		AdaptiveMode:   *adaptiveMode,
+	}
+}

@@ -94,6 +94,7 @@ type Gemini struct {
 	cancel context.CancelFunc
 	conn   *websocket.Conn
 	writeM sync.Mutex
+	wg     sync.WaitGroup // readLoop; Close waits on it
 	recvCh chan []int16
 	textCh chan model.Transcript
 
@@ -144,6 +145,7 @@ func New(ctx context.Context) (*Gemini, error) {
 		return nil, fmt.Errorf("gemini: setup: %w", err)
 	}
 
+	g.wg.Add(1)
 	go g.readLoop()
 	return g, nil
 }
@@ -225,6 +227,7 @@ func inlineAudioToModelPCM(raw []byte, mime string) []int16 {
 }
 
 func (g *Gemini) readLoop() {
+	defer g.wg.Done()
 	defer close(g.recvCh)
 	defer close(g.textCh)
 	first := true
@@ -323,7 +326,9 @@ func isCJKTranscriptionRune(r rune) bool {
 
 func (g *Gemini) Close() error {
 	g.cancel()
-	return g.conn.Close(websocket.StatusNormalClosure, "")
+	err := g.conn.Close(websocket.StatusNormalClosure, "")
+	g.wg.Wait() // readLoop has observed cancel/conn close and exited
+	return err
 }
 
 func truncate(b []byte, n int) string {

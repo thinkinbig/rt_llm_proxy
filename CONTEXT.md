@@ -22,3 +22,40 @@ The Bridge converts it to a **transcript line** at the recording point.
 `sidechannel.Tap` implements `transcript.Listener` and publishes
 `TranscriptEvent` protobuf messages using the seq from the recording point —
 it never assigns its own seq.
+
+## Session offer intake
+
+`offer.Intake` is the control-plane module for a new **Session**: rate limit,
+**Provider guard**, reconnect replay (`ResolveReplay`), then `MediaHub.Serve`
+to start the **Bridge**. `offer.Handler` is the thin HTTP adapter.
+
+## Provider guard
+
+`modelcb.Manager` is the **Provider guard**: per-provider circuit state,
+`AllowDial` / `RecordDial` on the offer path, and `RecordStreamFault` for early
+stream failures (within `modelcb.EarlyFaultWindow`) before the **Bridge** has
+sent audio. Dial and stream failures are tracked as separate streaks; a
+successful dial resets both. Loopback and a nil manager skip all guard logic.
+
+## Replay source wiring
+
+`offer.Intake` uses an explicit `KafkaReplayer` adapter (`Intake.Kafka`) for
+cross-node replay. It does not infer replay capability from `Publisher`.
+
+## Session archive
+
+`rtc` keeps reconnect history in a dedicated `sessionArchiveStore` module (TTL +
+ownership checks), separate from the live Bridge session registry.
+
+## Composition root
+
+`cmd/proxy` keeps startup composition in `runProxy`: it wires adapters from
+flags/config, starts admin endpoints, and enforces shutdown order
+(`http.Server.Shutdown` -> `Hub.CloseAll` -> `Publisher.Close`).
+
+## Session scope
+
+`rtc.sessionScope` owns one bridge’s media context, peer connection, and model.
+`Hub.Serve` commits the scope only after SDP succeeds; otherwise `defer` aborts
+without registering the session. Media lifetime is not tied to the offer HTTP
+request context.

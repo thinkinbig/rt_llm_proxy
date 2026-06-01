@@ -30,16 +30,18 @@ type SessionController struct {
 	downAt []int
 	upAt   []int
 
-	mu   sync.Mutex
-	idx  int
-	stop chan struct{}
+	mu        sync.Mutex
+	idx       int
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewSession starts a proactive controller. len(downAt) == len(upAt) == len(comps)-1.
 func NewSession(count func() int, set func(int), comps, downAt, upAt []int, interval time.Duration) *SessionController {
-	c := &SessionController{count: count, set: set, comps: comps, downAt: downAt, upAt: upAt, stop: make(chan struct{})}
+	c := &SessionController{count: count, set: set, comps: comps, downAt: downAt, upAt: upAt, stop: make(chan struct{}), done: make(chan struct{})}
 	set(comps[0])
-	go loop(interval, c.stop, func() { c.Step(c.count()) })
+	go loop(interval, c.stop, c.done, func() { c.Step(c.count()) })
 	return c
 }
 
@@ -65,8 +67,11 @@ func (c *SessionController) Level() int {
 	return c.comps[c.idx]
 }
 
-// Close stops the controller goroutine.
-func (c *SessionController) Close() { close(c.stop) }
+// Close stops the controller goroutine and waits for it to exit. Idempotent.
+func (c *SessionController) Close() {
+	c.closeOnce.Do(func() { close(c.stop) })
+	<-c.done
+}
 
 // DriftController steps complexity from the recent share of frames that missed
 // their slot (delta of the >=30ms bucket over total). highWM > lowWM gives
@@ -79,18 +84,20 @@ type DriftController struct {
 	lowWM   float64
 	dwell   int
 
-	mu    sync.Mutex
-	idx   int
-	since int
-	last  map[string]uint64
-	stop  chan struct{}
+	mu        sync.Mutex
+	idx       int
+	since     int
+	last      map[string]uint64
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewDrift starts a reactive controller. highWM/lowWM are drift fractions [0,1].
 func NewDrift(buckets func() map[string]uint64, set func(int), comps []int, highWM, lowWM float64, dwell int, interval time.Duration) *DriftController {
-	c := &DriftController{buckets: buckets, set: set, comps: comps, highWM: highWM, lowWM: lowWM, dwell: dwell, last: buckets(), stop: make(chan struct{})}
+	c := &DriftController{buckets: buckets, set: set, comps: comps, highWM: highWM, lowWM: lowWM, dwell: dwell, last: buckets(), stop: make(chan struct{}), done: make(chan struct{})}
 	set(comps[0])
-	go loop(interval, c.stop, func() {
+	go loop(interval, c.stop, c.done, func() {
 		cur := c.buckets()
 		c.Step(recentDrift(c.last, cur))
 		c.last = cur
@@ -125,7 +132,11 @@ func (c *DriftController) Level() int {
 	return c.comps[c.idx]
 }
 
-func (c *DriftController) Close() { close(c.stop) }
+// Close stops the controller goroutine and waits for it to exit. Idempotent.
+func (c *DriftController) Close() {
+	c.closeOnce.Do(func() { close(c.stop) })
+	<-c.done
+}
 
 // recentDrift is delta(>=30ms) / delta(total) between two histogram snapshots.
 func recentDrift(last, cur map[string]uint64) float64 {
@@ -139,7 +150,8 @@ func recentDrift(last, cur map[string]uint64) float64 {
 	return float64(cur[">=30ms"]-last[">=30ms"]) / float64(total)
 }
 
-func loop(interval time.Duration, stop <-chan struct{}, tick func()) {
+func loop(interval time.Duration, stop <-chan struct{}, done chan<- struct{}, tick func()) {
+	defer close(done)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {

@@ -1,6 +1,6 @@
-// Package modelcb provides lightweight circuit breakers for model connect
-// attempts. It protects the offer path from repeatedly dialing an unhealthy
-// upstream provider.
+// Package modelcb is the provider guard: per-provider circuit breakers for model
+// dials on the offer path and early stream faults on the Bridge. It protects
+// new session creation from repeatedly dialing an unhealthy upstream provider.
 package modelcb
 
 import (
@@ -8,6 +8,11 @@ import (
 	"sync"
 	"time"
 )
+
+// EarlyFaultWindow is how soon after session start a provider stream failure
+// with no audio produced yet counts as an upstream fault (connected but dead
+// on arrival).
+const EarlyFaultWindow = 10 * time.Second
 
 type State string
 
@@ -38,8 +43,9 @@ type breaker struct {
 	reason    string
 	openUntil time.Time
 
-	failures int
-	success  int
+	connectFailures int
+	streamFailures  int
+	success         int
 
 	halfOpenProbeInFlight bool
 
@@ -50,18 +56,67 @@ type Manager struct {
 	mu       sync.Mutex
 	defaults Config
 	provider map[string]*breaker
+	now      func() time.Time
 }
 
 func New(defaults Config, overrides map[string]Config) *Manager {
 	m := &Manager{
 		defaults: normalize(defaults),
 		provider: make(map[string]*breaker),
+		now:      time.Now,
 	}
 	for p, cfg := range overrides {
 		c := normalize(merge(m.defaults, cfg))
 		m.provider[p] = &breaker{cfg: c, state: StateClosed}
 	}
 	return m
+}
+
+func (m *Manager) skipped(provider string) bool {
+	return m == nil || provider == "loopback"
+}
+
+// AllowDial gates a new provider dial on the offer path. Loopback and a nil
+// manager are always allowed.
+func (m *Manager) AllowDial(provider string, now time.Time) Decision {
+	if m.skipped(provider) {
+		return Decision{Allowed: true, State: StateClosed}
+	}
+	return m.Allow(provider, now)
+}
+
+// RecordDial records the outcome of a provider dial; a successful dial is
+// treated as upstream recovery.
+func (m *Manager) RecordDial(provider string, err error, now time.Time) {
+	if m.skipped(provider) {
+		return
+	}
+	m.Record(provider, err, now)
+}
+
+// RecordStreamFault records an early provider Recv failure (no audio yet,
+// within EarlyFaultWindow) for circuit-breaker purposes.
+func (m *Manager) RecordStreamFault(provider string, sessionStart time.Time, producedAudio bool, err error, now time.Time) {
+	if m.skipped(provider) || err == nil || producedAudio {
+		return
+	}
+	if now.Sub(sessionStart) >= EarlyFaultWindow {
+		return
+	}
+	m.get(provider).recordStreamFailure(now)
+}
+
+// StreamFaultBinder returns a factory the Bridge calls once session start time
+// is known. Returns nil when reporting is disabled (nil manager or loopback).
+func (m *Manager) StreamFaultBinder(provider string) func(sessionStart time.Time) func(producedAudio bool, err error) {
+	if m.skipped(provider) {
+		return nil
+	}
+	return func(sessionStart time.Time) func(producedAudio bool, err error) {
+		return func(producedAudio bool, err error) {
+			m.RecordStreamFault(provider, sessionStart, producedAudio, err, m.now())
+		}
+	}
 }
 
 func (m *Manager) Allow(provider string, now time.Time) Decision {
@@ -74,7 +129,7 @@ func (m *Manager) Record(provider string, err error, now time.Time) {
 		m.get(provider).recordSuccess()
 		return
 	}
-	m.get(provider).recordFailure(classify(err), now)
+	m.get(provider).recordDialFailure(classify(err), now)
 }
 
 func (m *Manager) Stats() map[string]map[string]any {
@@ -99,7 +154,9 @@ func (m *Manager) Stats() map[string]map[string]any {
 			"state":             string(b.state),
 			"reason":            b.reason,
 			"retry_after_sec":   retry,
-			"failures":          b.failures,
+			"failures":          b.connectFailures + b.streamFailures,
+			"connect_failures":  b.connectFailures,
+			"stream_failures":   b.streamFailures,
 			"half_open_success": b.success,
 		}
 		b.mu.Unlock()
@@ -154,20 +211,22 @@ func (b *breaker) recordSuccess() {
 	defer b.mu.Unlock()
 	switch b.state {
 	case StateClosed:
-		b.failures = 0
+		b.connectFailures = 0
+		b.streamFailures = 0
 	case StateHalfOpen:
 		b.halfOpenProbeInFlight = false
 		b.success++
 		if b.success >= b.cfg.HalfOpenSuccess {
 			b.state = StateClosed
 			b.reason = ""
-			b.failures = 0
+			b.connectFailures = 0
+			b.streamFailures = 0
 			b.success = 0
 		}
 	}
 }
 
-func (b *breaker) recordFailure(reason string, now time.Time) {
+func (b *breaker) recordDialFailure(reason string, now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -184,8 +243,8 @@ func (b *breaker) recordFailure(reason string, now time.Time) {
 		open = true
 	case StateClosed:
 		if !open {
-			b.failures++
-			if b.failures >= b.cfg.OpenAfter {
+			b.connectFailures++
+			if b.connectFailures >= b.cfg.OpenAfter {
 				open = true
 			}
 		}
@@ -196,10 +255,38 @@ func (b *breaker) recordFailure(reason string, now time.Time) {
 	if !open {
 		return
 	}
+	b.open(reason, now.Add(openFor))
+}
+
+func (b *breaker) recordStreamFailure(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	open := false
+	switch b.state {
+	case StateHalfOpen:
+		b.halfOpenProbeInFlight = false
+		open = true
+	case StateClosed:
+		b.streamFailures++
+		if b.streamFailures >= b.cfg.OpenAfter {
+			open = true
+		}
+	case StateOpen:
+		return
+	}
+	if !open {
+		return
+	}
+	b.open("stream_early", now.Add(b.cfg.OpenFor))
+}
+
+func (b *breaker) open(reason string, until time.Time) {
 	b.state = StateOpen
 	b.reason = reason
-	b.openUntil = now.Add(openFor)
-	b.failures = 0
+	b.openUntil = until
+	b.connectFailures = 0
+	b.streamFailures = 0
 	b.success = 0
 }
 

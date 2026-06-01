@@ -49,6 +49,7 @@ type Doubao struct {
 	cancel       context.CancelFunc
 	conn         *websocket.Conn
 	writeM       sync.Mutex
+	wg           sync.WaitGroup // readLoop + keepAlive; Close waits on it
 	recvCh       chan []int16
 	transcriptCh chan transcript
 	sid          string
@@ -105,6 +106,7 @@ func New(ctx context.Context) (*Doubao, error) {
 	}
 	d.lastSend.Store(time.Now().UnixNano())
 
+	d.wg.Add(2)
 	go d.readLoop()
 	go d.keepAlive()
 	return d, nil
@@ -233,6 +235,7 @@ func f32leToPCM(b []byte) []int16 {
 }
 
 func (d *Doubao) readLoop() {
+	defer d.wg.Done()
 	defer close(d.recvCh)
 	defer close(d.transcriptCh)
 	for {
@@ -281,6 +284,7 @@ func (d *Doubao) readLoop() {
 // keepAlive pushes 100ms of silence whenever the upstream has been idle for 5s,
 // keeping the session open (required by the server).
 func (d *Doubao) keepAlive() {
+	defer d.wg.Done()
 	silence := gzipBytes(make([]byte, doubaoInRate/10*2)) // 100ms @ 16kHz s16 mono
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -302,7 +306,9 @@ func (d *Doubao) keepAlive() {
 
 func (d *Doubao) Close() error {
 	d.cancel()
-	return d.conn.Close(websocket.StatusNormalClosure, "")
+	err := d.conn.Close(websocket.StatusNormalClosure, "")
+	d.wg.Wait() // readLoop + keepAlive have observed cancel/conn close and exited
+	return err
 }
 
 // --- helpers ---

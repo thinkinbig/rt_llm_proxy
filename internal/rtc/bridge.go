@@ -12,7 +12,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"slices"
 	"sync"
 	"time"
 
@@ -41,10 +40,6 @@ const (
 	// the archives map would grow unbounded on a long-lived host.
 	archiveTTL = 5 * time.Minute
 
-	// earlyFaultWindow is how soon after a session starts a provider stream
-	// failure (with no audio produced yet) counts as an upstream fault worth
-	// reporting to the circuit breaker — "connected but dead on arrival".
-	earlyFaultWindow = 10 * time.Second
 )
 
 // Hub holds the shared WebRTC API and the registry of active sessions, keyed by
@@ -53,10 +48,8 @@ type Hub struct {
 	api   *webrtc.API
 	mu    sync.Mutex
 	conns map[identity.SessionID]*session
-	// archives keeps a bounded transcript history for disconnected sessions so a
-	// reconnecting client can resume from session_id + last_seq on this node.
-	// Entries expire after archiveTTL and are swept lazily on insert.
-	archives map[identity.SessionID]sessionArchive
+	// archives owns disconnected-session replay state.
+	archives *sessionArchiveStore
 	// wg tracks the per-session media/transcript goroutines so CloseAll can wait
 	// for them to drain before the process tears down shared dependencies (e.g.
 	// the side-channel publisher).
@@ -72,14 +65,6 @@ type session struct {
 	createdAt time.Time
 	rec       *transcript.Recorder
 	cleanup   func()
-}
-
-type sessionArchive struct {
-	provider string
-	userID   identity.UserID
-	history  []transcript.Line
-	maxSeq   uint64
-	expiry   time.Time
 }
 
 // NewHub builds the pion API with a custom MediaEngine (Opus + our fmtp) and
@@ -105,7 +90,7 @@ func NewHub() (*Hub, error) {
 	return &Hub{
 		api:      api,
 		conns:    make(map[identity.SessionID]*session),
-		archives: make(map[identity.SessionID]sessionArchive),
+		archives: newSessionArchiveStore(archiveTTL, time.Now),
 	}, nil
 }
 
@@ -135,26 +120,12 @@ func (h *Hub) add(s *session) {
 func (h *Hub) remove(s *session) {
 	snapshot := s.rec.FullHistory()
 	maxSeq := s.rec.MaxSeq()
-	now := time.Now()
 	h.mu.Lock()
 	delete(h.conns, s.id)
-	// Lazy reaper: drop expired archives whenever a session disconnects, so the
-	// map can't grow without bound under session churn.
-	for id, arch := range h.archives {
-		if now.After(arch.expiry) {
-			delete(h.archives, id)
-		}
-	}
-	if len(snapshot) > 0 {
-		h.archives[s.id] = sessionArchive{
-			provider: s.provider,
-			userID:   s.userID,
-			history:  snapshot,
-			maxSeq:   maxSeq,
-			expiry:   now.Add(archiveTTL),
-		}
-	}
 	h.mu.Unlock()
+	if len(snapshot) > 0 {
+		h.archives.put(s.id, s.provider, s.userID, snapshot, maxSeq)
+	}
 }
 
 // Count returns the number of currently active sessions.
@@ -176,7 +147,6 @@ func (h *Hub) Resume(sessionID identity.SessionID, userID identity.UserID, provi
 	}
 	var takeover func()
 	var active *session
-	var archived sessionArchive
 	h.mu.Lock()
 	if s, exists := h.conns[sessionID]; exists {
 		if s.provider != provider || s.userID != userID {
@@ -185,35 +155,22 @@ func (h *Hub) Resume(sessionID identity.SessionID, userID identity.UserID, provi
 		}
 		active = s
 		takeover = s.cleanup
-		ok = true
-	} else if arch, exists := h.archives[sessionID]; exists {
-		if arch.provider != provider || arch.userID != userID || time.Now().After(arch.expiry) {
-			h.mu.Unlock()
-			return nil, nil, 0, false
-		}
-		archived = arch
-		ok = true
 	}
 	h.mu.Unlock()
-	if !ok {
-		return nil, nil, 0, false
-	}
 	if active != nil {
 		full = active.rec.FullHistory()
 		startSeq = active.rec.MaxSeq()
-	} else {
-		full = slices.Clone(archived.history)
-		startSeq = archived.maxSeq
-	}
-	if takeover != nil {
-		takeover()
-	}
-	for _, line := range full {
-		if line.Seq > afterSeq {
-			replay = append(replay, line)
+		if takeover != nil {
+			takeover()
 		}
+		for _, line := range full {
+			if line.Seq > afterSeq {
+				replay = append(replay, line)
+			}
+		}
+		return full, replay, startSeq, true
 	}
-	return full, replay, startSeq, true
+	return h.archives.resume(sessionID, userID, provider, afterSeq)
 }
 
 // SessionState returns provider/max seq for a session id owned by userID, from
@@ -232,19 +189,12 @@ func (h *Hub) SessionState(sessionID identity.SessionID, userID identity.UserID)
 			return "", 0, false
 		}
 		active = s
-	} else if arch, exists := h.archives[sessionID]; exists {
-		if arch.userID != userID || time.Now().After(arch.expiry) {
-			h.mu.Unlock()
-			return "", 0, false
-		}
-		h.mu.Unlock()
-		return arch.provider, arch.maxSeq, true
 	}
 	h.mu.Unlock()
 	if active != nil {
 		return active.provider, active.rec.MaxSeq(), true
 	}
-	return "", 0, false
+	return h.archives.state(sessionID, userID)
 }
 
 // SessionInfo is the identity the handler resolved for a new session: the
@@ -257,20 +207,32 @@ type SessionInfo struct {
 	InitialHistory []transcript.Line
 	Replay         []transcript.Line
 	Transcript     transcript.Listener
-	// OnModelFault, if set, is called when the provider stream fails before
-	// producing any audio within earlyFaultWindow — a "connected but dead on
-	// arrival" upstream fault the handler feeds into the circuit breaker. nil
-	// disables the report (e.g. loopback).
-	OnModelFault func(error)
+	// StreamFaultAt, if set, is called once the session start time is known.
+	// It returns a reporter for early provider stream faults (see
+	// modelcb.EarlyFaultWindow). nil disables reporting (e.g. loopback).
+	StreamFaultAt func(sessionStart time.Time) func(producedAudio bool, err error)
+}
+
+type sampleWriter interface {
+	WriteSample(media.Sample) error
+}
+
+type pcmReceiver interface {
+	Recv() ([]int16, error)
+}
+
+type frameEncoder interface {
+	Encode([]int16) ([]byte, error)
 }
 
 // Serve sets up the peer connection for one session and returns the answer SDP.
 // Media bridging runs in background goroutines that tear down when the
 // connection drops, the model session ends, or the hub is closed.
 // Serve takes ownership of m: on every error return it closes m (directly on the
-// early setup failures, via sess.cleanup once the session exists), and on success
+// early setup failures, via sessionScope.Close once committed), and on success
 // the session owns and closes it. Callers must not close m after calling Serve.
-func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info SessionInfo) (string, error) {
+// Session media lifetime is independent of any HTTP request context (see sessionScope).
+func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, error) {
 	pc, err := h.api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		m.Close()
@@ -293,17 +255,17 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info Se
 		return "", err
 	}
 
-	sctx, scancel := context.WithCancel(ctx)
 	meta := transcript.SessionMeta{
 		SessionID: info.ID,
 		UserID:    info.UserID,
 		Provider:  info.Provider,
 	}
+	started := time.Now()
 	sess := &session{
 		id:        info.ID,
 		userID:    info.UserID,
 		provider:  info.Provider,
-		createdAt: time.Now(),
+		createdAt: started,
 		rec: transcript.NewRecorder(
 			info.StartSeq,
 			info.InitialHistory,
@@ -312,16 +274,8 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info Se
 			info.Transcript,
 		),
 	}
-	var cleanupOnce sync.Once
-	sess.cleanup = func() {
-		cleanupOnce.Do(func() {
-			scancel()
-			m.Close()
-			pc.Close()
-			h.remove(sess)
-		})
-	}
-	h.add(sess)
+	scope := newSessionScope(h, pc, m, sess)
+	defer scope.abortIfUncommitted()
 
 	// Drain RTCP so the send buffer doesn't fill up.
 	h.wg.Go(func() {
@@ -356,7 +310,7 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info Se
 		if t, ok := m.(model.Transcriber); ok {
 			start := func() {
 				replayOnce.Do(func() { sendReplay(dc, info.Replay) })
-				h.wg.Go(func() { forwardTranscripts(sctx, dc, t, sess) })
+				h.wg.Go(func() { forwardTranscripts(scope.mediaCtx(), dc, t, sess) })
 			}
 			if dc.ReadyState() == webrtc.DataChannelStateOpen {
 				start()
@@ -376,27 +330,29 @@ func (h *Hub) Serve(ctx context.Context, offerSDP string, m model.Model, info Se
 		}
 	})
 
+	var reportStreamFault func(producedAudio bool, err error)
+	if info.StreamFaultAt != nil {
+		reportStreamFault = info.StreamFaultAt(started)
+	}
 	// Outbound pump: model audio -> browser.
-	h.wg.Go(func() { writeOutbound(sctx, out, m, sess, info.OnModelFault) })
+	h.wg.Go(func() { writeOutbound(scope.mediaCtx(), out, m, reportStreamFault, info.ID) })
 
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer, SDP: offerSDP,
 	}); err != nil {
-		sess.cleanup()
 		return "", err
 	}
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
-		sess.cleanup()
 		return "", err
 	}
 	gather := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(answer); err != nil {
-		sess.cleanup()
 		return "", err
 	}
 	<-gather // non-trickle: return the full SDP with candidates
 
+	scope.commit()
 	return pc.LocalDescription().SDP, nil
 }
 
@@ -424,30 +380,47 @@ func readInbound(track *webrtc.TrackRemote, m model.Model) {
 	}
 }
 
-func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m model.Model, sess *session, onFault func(error)) {
+func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m model.Model, reportFault func(producedAudio bool, err error), sessionID identity.SessionID) {
 	enc, err := audio.NewEncoder()
 	if err != nil {
 		log.Printf("rtc: encoder: %v", err)
 		return
 	}
-	produced := false
-	// A single Ticker fires on a fixed 20ms wall clock, so per-frame encode time is
-	// absorbed instead of added on top — a per-frame time.After drifts slower
-	// than real time, backing audio up and growing end-to-end latency. During
-	// silence the extra ticks coalesce into the size-1 buffer (no burst on resume).
 	ticker := time.NewTicker(frameDur)
 	defer ticker.Stop()
+	writeOutboundLoop(ctx, out, m, enc, ticker.C, reportFault, time.Now, sessionID)
+}
 
+func writeOutboundLoop(
+	ctx context.Context,
+	out sampleWriter,
+	recv pcmReceiver,
+	enc frameEncoder,
+	ticks <-chan time.Time,
+	reportFault func(producedAudio bool, err error),
+	now func() time.Time,
+	sessionID identity.SessionID,
+) {
+	produced := false
 	var buf []int16
 	var last time.Time // wall clock of the previous frame emission
+	exit := func(reason string, recvErr error) {
+		metrics.RecordOutboundPumpExit(reason)
+		if recvErr != nil {
+			log.Printf("rtc: outbound pump exit session=%s reason=%s produced=%v err=%v",
+				sessionID, reason, produced, recvErr)
+		} else {
+			log.Printf("rtc: outbound pump exit session=%s reason=%s produced=%v",
+				sessionID, reason, produced)
+		}
+	}
 	for {
-		pcm, err := m.Recv()
+		pcm, err := recv.Recv()
 		if err != nil {
-			// Connected-but-dead-on-arrival: a stream error before any audio was
-			// produced, soon after start, is an upstream fault for the breaker.
-			if !produced && onFault != nil && time.Since(sess.createdAt) < earlyFaultWindow {
-				onFault(err)
+			if reportFault != nil {
+				reportFault(produced, err)
 			}
+			exit("recv", err)
 			return
 		}
 		buf = append(buf, pcm...)
@@ -458,18 +431,21 @@ func writeOutbound(ctx context.Context, out *webrtc.TrackLocalStaticSample, m mo
 				continue
 			}
 			if err := out.WriteSample(media.Sample{Data: data, Duration: frameDur}); err != nil {
+				exit("write_sample", err)
 				return
 			}
+			metrics.RecordOutboundFrameWritten()
 			produced = true
 			// Record the realized emission cadence (the §3.1 pacing SLO).
-			now := time.Now()
+			at := now()
 			if !last.IsZero() {
-				metrics.ObserveFrameInterval(now.Sub(last))
+				metrics.ObserveFrameInterval(at.Sub(last))
 			}
-			last = now
+			last = at
 			select {
-			case <-ticker.C:
+			case <-ticks:
 			case <-ctx.Done():
+				exit("ctx", ctx.Err())
 				return
 			}
 		}

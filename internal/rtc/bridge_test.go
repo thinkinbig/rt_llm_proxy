@@ -1,8 +1,14 @@
 package rtc
 
 import (
+	"context"
+	"errors"
+	"io"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 	"github.com/thinkinbig/rt-llm-proxy/internal/transcript"
@@ -11,7 +17,7 @@ import (
 func newTestHub() *Hub {
 	return &Hub{
 		conns:    map[identity.SessionID]*session{},
-		archives: map[identity.SessionID]sessionArchive{},
+		archives: newSessionArchiveStore(time.Minute, time.Now),
 	}
 }
 
@@ -23,7 +29,8 @@ func TestResumeOwnershipAndExpiry(t *testing.T) {
 
 	t.Run("owner resumes", func(t *testing.T) {
 		h := newTestHub()
-		h.archives["s1"] = fresh()
+		arch := fresh()
+		h.archives.put("s1", arch.provider, arch.userID, arch.history, arch.maxSeq)
 		full, replay, startSeq, ok := h.Resume("s1", "alice", "gemini", 1)
 		if !ok || startSeq != 2 || len(full) != 2 || len(replay) != 1 || replay[0].Seq != 2 {
 			t.Fatalf("owner resume = %v %v %d %v", full, replay, startSeq, ok)
@@ -32,7 +39,8 @@ func TestResumeOwnershipAndExpiry(t *testing.T) {
 
 	t.Run("other user rejected", func(t *testing.T) {
 		h := newTestHub()
-		h.archives["s1"] = fresh()
+		arch := fresh()
+		h.archives.put("s1", arch.provider, arch.userID, arch.history, arch.maxSeq)
 		if _, _, _, ok := h.Resume("s1", "bob", "gemini", 1); ok {
 			t.Fatal("cross-user resume must be rejected")
 		}
@@ -40,7 +48,8 @@ func TestResumeOwnershipAndExpiry(t *testing.T) {
 
 	t.Run("anonymous rejected", func(t *testing.T) {
 		h := newTestHub()
-		h.archives["s1"] = fresh()
+		arch := fresh()
+		h.archives.put("s1", arch.provider, arch.userID, arch.history, arch.maxSeq)
 		if _, _, _, ok := h.Resume("s1", "", "gemini", 1); ok {
 			t.Fatal("anonymous resume must be rejected")
 		}
@@ -48,7 +57,8 @@ func TestResumeOwnershipAndExpiry(t *testing.T) {
 
 	t.Run("provider mismatch rejected", func(t *testing.T) {
 		h := newTestHub()
-		h.archives["s1"] = fresh()
+		arch := fresh()
+		h.archives.put("s1", arch.provider, arch.userID, arch.history, arch.maxSeq)
 		if _, _, _, ok := h.Resume("s1", "alice", "doubao", 1); ok {
 			t.Fatal("provider mismatch must be rejected")
 		}
@@ -56,9 +66,11 @@ func TestResumeOwnershipAndExpiry(t *testing.T) {
 
 	t.Run("expired archive rejected", func(t *testing.T) {
 		h := newTestHub()
+		now := time.Now()
+		h.archives = newSessionArchiveStore(time.Minute, func() time.Time { return now })
 		arch := fresh()
-		arch.expiry = time.Now().Add(-time.Second)
-		h.archives["s1"] = arch
+		h.archives.put("s1", arch.provider, arch.userID, arch.history, arch.maxSeq)
+		h.archives.now = func() time.Time { return now.Add(2 * time.Minute) }
 		if _, _, _, ok := h.Resume("s1", "alice", "gemini", 1); ok {
 			t.Fatal("expired archive must be rejected")
 		}
@@ -101,3 +113,144 @@ func TestRecorderSnapshotAfterSeq(t *testing.T) {
 type listenerFunc func(transcript.SessionMeta, transcript.Line)
 
 func (f listenerFunc) OnLine(m transcript.SessionMeta, l transcript.Line) { f(m, l) }
+
+type fakeReceiver struct {
+	mu    sync.Mutex
+	pcms  [][]int16
+	err   error
+	calls int
+}
+
+func (r *fakeReceiver) Recv() ([]int16, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if len(r.pcms) == 0 {
+		return nil, r.err
+	}
+	p := r.pcms[0]
+	r.pcms = r.pcms[1:]
+	return p, nil
+}
+
+type fakeEncoder struct {
+	failAt int
+	calls  int
+}
+
+func (e *fakeEncoder) Encode(in []int16) ([]byte, error) {
+	e.calls++
+	if e.failAt > 0 && e.calls == e.failAt {
+		return nil, errors.New("encode failed")
+	}
+	return []byte{byte(len(in) % 251)}, nil
+}
+
+type fakeWriter struct {
+	mu      sync.Mutex
+	samples []media.Sample
+}
+
+func (w *fakeWriter) WriteSample(s media.Sample) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.samples = append(w.samples, s)
+	return nil
+}
+
+func TestWriteOutboundLoopReportsEarlyFaultBeforeAudio(t *testing.T) {
+	recv := &fakeReceiver{err: io.EOF}
+	enc := &fakeEncoder{}
+	out := &fakeWriter{}
+	ticks := make(chan time.Time, 1)
+
+	var gotProduced bool
+	var gotErr error
+	writeOutboundLoop(context.Background(), out, recv, enc, ticks, func(produced bool, err error) {
+		gotProduced = produced
+		gotErr = err
+	}, time.Now, "")
+
+	if gotProduced {
+		t.Fatal("expected produced=false for first Recv failure")
+	}
+	if !errors.Is(gotErr, io.EOF) {
+		t.Fatalf("report error = %v, want EOF", gotErr)
+	}
+}
+
+func TestWriteOutboundLoopReportsFaultAfterAudio(t *testing.T) {
+	recv := &fakeReceiver{
+		pcms: [][]int16{
+			make([]int16, frameSamples),
+		},
+		err: io.EOF,
+	}
+	enc := &fakeEncoder{}
+	out := &fakeWriter{}
+	ticks := make(chan time.Time, 1)
+	ticks <- time.Now()
+
+	var gotProduced bool
+	writeOutboundLoop(context.Background(), out, recv, enc, ticks, func(produced bool, err error) {
+		gotProduced = produced
+	}, time.Now, "")
+
+	if !gotProduced {
+		t.Fatal("expected produced=true once at least one frame was written")
+	}
+	if len(out.samples) != 1 {
+		t.Fatalf("written samples = %d, want 1", len(out.samples))
+	}
+}
+
+func TestWriteOutboundLoopSplitsIntoFrames(t *testing.T) {
+	recv := &fakeReceiver{
+		pcms: [][]int16{
+			make([]int16, frameSamples*2+100),
+		},
+		err: io.EOF,
+	}
+	enc := &fakeEncoder{}
+	out := &fakeWriter{}
+	ticks := make(chan time.Time, 2)
+	ticks <- time.Now()
+	ticks <- time.Now()
+
+	writeOutboundLoop(context.Background(), out, recv, enc, ticks, nil, time.Now, "")
+
+	if len(out.samples) != 2 {
+		t.Fatalf("written samples = %d, want 2", len(out.samples))
+	}
+	if enc.calls != 2 {
+		t.Fatalf("encode calls = %d, want 2", enc.calls)
+	}
+}
+
+func TestWriteOutboundLoopStopsOnContextDone(t *testing.T) {
+	recv := &fakeReceiver{
+		pcms: [][]int16{
+			make([]int16, frameSamples),
+			make([]int16, frameSamples),
+		},
+		err: io.EOF,
+	}
+	enc := &fakeEncoder{}
+	out := &fakeWriter{}
+	ticks := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		writeOutboundLoop(ctx, out, recv, enc, ticks, nil, time.Now, "")
+		close(done)
+	}()
+
+	// First frame write blocks on tick gate; cancel should unblock via ctx.Done.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("writeOutboundLoop did not stop after context cancellation")
+	}
+}

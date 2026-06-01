@@ -26,6 +26,37 @@ var replayTimeouts [len(replaySources)]atomic.Uint64 // kafka-only in practice
 var replayErrors [len(replaySources)]atomic.Uint64   // kafka-only in practice
 var replayLatencyBuckets [len(replaySources)][len(replayLatencyLabels)]atomic.Uint64
 
+var outboundFramesWritten atomic.Uint64
+var outboundPumpExitWriteSample atomic.Uint64
+var outboundPumpExitRecv atomic.Uint64
+var outboundPumpExitCtx atomic.Uint64
+
+// RecordOutboundFrameWritten counts one successful outbound WriteSample.
+func RecordOutboundFrameWritten() { outboundFramesWritten.Add(1) }
+
+// RecordOutboundPumpExit counts why an outbound media pump goroutine stopped.
+// reason is one of: write_sample, recv, ctx.
+func RecordOutboundPumpExit(reason string) {
+	switch reason {
+	case "write_sample":
+		outboundPumpExitWriteSample.Add(1)
+	case "recv":
+		outboundPumpExitRecv.Add(1)
+	case "ctx":
+		outboundPumpExitCtx.Add(1)
+	}
+}
+
+// OutboundMediaStats returns outbound pump counters for /stats and load tests.
+func OutboundMediaStats() map[string]uint64 {
+	return map[string]uint64{
+		"frames_written":         outboundFramesWritten.Load(),
+		"pump_exit_write_sample": outboundPumpExitWriteSample.Load(),
+		"pump_exit_recv":         outboundPumpExitRecv.Load(),
+		"pump_exit_ctx":          outboundPumpExitCtx.Load(),
+	}
+}
+
 // ObserveFrameInterval records the wall-clock gap between two consecutive
 // outbound frames. Called once per frame on the media hot path; keep it cheap.
 func ObserveFrameInterval(d time.Duration) {
