@@ -3,20 +3,152 @@
 How rt-llm-proxy is put together, and **why** each non-obvious engineering
 decision is the way it is. Kept deliberately small — this is a small project.
 
-## 1. Data flow
+## 1. Architecture
+
+**Invariant (load-bearing):** the control / personalization plane must never gate
+the real-time media plane (§3.3). Fault tolerance below follows that rule —
+degrade the feature, not the call, unless the failure is an explicit hard guard
+(rate limit at capacity, circuit open).
+
+### 1.1 System overview
+
+```mermaid
+flowchart TB
+  subgraph browser["Browser"]
+    WEB["WebRTC<br/>Opus audio + DataChannel JSON"]
+  end
+
+  subgraph proxy["rt-llm-proxy"]
+    direction TB
+    subgraph control["Control plane — POST /?model="]
+      OFFER["offer.Handler"]
+      RL["ratelimit"]
+      AUTH["auth"]
+      CB["modelcb"]
+      REPLAY["ResolveReplay"]
+      OFFER --> RL
+      OFFER --> AUTH
+      OFFER --> CB
+      OFFER --> REPLAY
+    end
+    subgraph data["Data plane — per session"]
+      HUB["rtc.Hub / SessionManager"]
+      BRIDGE["rtc.Bridge"]
+      REC["transcript.Recorder"]
+      ADAPT["adaptive Opus complexity<br/>(optional)"]
+      HUB --> BRIDGE
+      BRIDGE --> REC
+      ADAPT -.-> BRIDGE
+    end
+    OFFER -->|"mint session_id · replay history"| HUB
+    TAP["sidechannel.Tap"]
+    REC --> TAP
+  end
+
+  subgraph optional["Optional backends"]
+    REDIS[("Redis")]
+    KAFKA[("Kafka")]
+  end
+
+  subgraph upstream["Providers — WebSocket"]
+    MODELS["gemini · doubao · loopback"]
+  end
+
+  WEB <-->|"Opus ↔ JSON {seq,role,text}"| BRIDGE
+  BRIDGE <-->|"mono s16 PCM @ 48 kHz"| MODELS
+  RL <-->|"INCR+EXPIRE (Lua)"| REDIS
+  TAP -->|"Publish (non-blocking)"| KAFKA
+  REPLAY -.->|"memory archive · optional Kafka tail"| HUB
+  REPLAY -.-> KAFKA
+  CB -.->|"connect + early stream fault"| MODELS
+```
+
+Solid arrows are on the hot path; dashed arrows are best-effort or optional.
+Redis and Kafka are **never** on the 20ms audio loop.
+
+### 1.2 Media data path
 
 ```
-browser ──WebRTC(Opus audio + datachannel)──▶ proxy ──WebSocket(PCM)──▶ Gemini / Doubao
-        ◀──────────── Opus audio ────────────         ◀──── PCM ──────
+browser ──WebRTC(Opus audio + datachannel)──▶ rtc.Bridge ──WebSocket(PCM)──▶ provider
+        ◀──────────── Opus audio ────────────              ◀──── PCM ──────
 ```
 
 - **Inbound (mic → model):** `track.ReadRTP` → Opus decode → mono s16 PCM @48kHz
   → `Model.SendAudio`. The provider adapter resamples to its own wire rate.
 - **Outbound (model → speaker):** `Model.Recv` → accumulate into a buffer →
-  Opus-encode each 20ms / 960-sample frame → `WriteSample`, **paced at real time**.
+  Opus-encode each 20ms / 960-sample frame → `WriteSample`, **paced at real time**
+  (session `time.Ticker`, §3.1). Optional `-adaptive` lowers encoder complexity
+  under load (§3.11).
 - **Data channel:** browser typed text → `Recorder.Record("user")` + `Model.SendText`;
   provider STT (`RecvTranscript`) → `Recorder.Record` → browser as JSON
   `{seq,role,text}` so reconnect can resume from `last_seq`.
+
+### 1.3 Control & reconnect path
+
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant O as offer.Handler
+  participant R as ResolveReplay
+  participant H as rtc.Hub
+  participant M as Provider
+
+  B->>O: POST SDP offer<br/>?model= · Bearer · X-Session-ID / X-Last-Seq
+  O->>O: ratelimit (429 if full)
+  O->>O: auth → user_id (or "")
+  O->>O: modelcb.Allow (503 if open)
+  O->>M: Models.New (502 on dial error)
+  O->>R: memory archive → optional Kafka tail
+  Note over R: timeout / miss → status miss,<br/>media still starts
+  O->>H: Serve(SDP, model, replay history)
+  O-->>B: answer SDP + X-Session-ID + X-Replay-Status
+  H-->>B: WebRTC media (background)
+```
+
+Reconnect is **best-effort**: malformed replay headers → `400`; incomplete
+headers → fresh session; Kafka over budget → `kafka_timeout` / `kafka_error` but
+the call proceeds.
+
+### 1.4 Fault tolerance & degradation
+
+| Layer | Component | Trigger | Policy | Blocks media? |
+|---|---|---|---|---|
+| Control | `ratelimit` | Redis error | **Fail open** (allow + log) | No |
+| Control | `ratelimit` | window full | `429` | Yes (offer only) |
+| Control | `auth` | missing / invalid token | **Anonymous** `user_id=""` | No |
+| Control | `modelcb` | circuit open / half-open gated | `503` + `Retry-After` | Yes (offer only) |
+| Control | `modelcb` | N connect failures / auth error | Open per provider | Yes (offer only) |
+| Control | `modelcb` | stream error before first audio (within 10s) | `OnModelFault` → `Record` | No (existing sessions continue) |
+| Control | `ResolveReplay` | timeout / miss / disabled | `X-Replay-Status` degrade | No |
+| Side | `sidechannel` / Kafka | buffer full / closed | **Drop** + `dropped_total` | No |
+| Data | `rtc.Bridge` | provider silence | Ticker coalesces ticks (no burst) | No |
+| Data | Opus | packet loss | In-band FEC + DTX (uplink fmtp, downlink encoder) | No |
+| Data | `adaptive` | high session count or frame drift | Lower Opus complexity | No (quality tradeoff) |
+| Data | lifecycle | disconnect / SIGTERM | `sync.Once` cleanup · `CloseAll` | N/A |
+
+```mermaid
+flowchart LR
+  subgraph hard["Hard guards — offer only"]
+    RL429["ratelimit full → 429"]
+    CB503["circuit open → 503"]
+  end
+  subgraph soft["Soft degradation — call continues"]
+    RLO["Redis blip → allow"]
+    ANON["auth fail → anonymous"]
+    REP["replay miss → fresh / partial history"]
+    DROP["Kafka full → drop event"]
+    ADP["load → lower Opus complexity"]
+  end
+  subgraph media["Media path — no external RTT"]
+    BR["Bridge ↔ provider PCM loop"]
+  end
+  hard --> OFFER["offer.Handler"]
+  soft --> OFFER
+  OFFER --> media
+```
+
+Failover levels (L1–L4) and production scaling notes live in
+[README § Scaling & failover](../README.md#scaling--failover).
 
 ## 2. Modules & seams
 
@@ -24,7 +156,10 @@ browser ──WebRTC(Opus audio + datachannel)──▶ proxy ──WebSocket(PC
 |---|---|---|
 | **Bridge** | `internal/rtc` | Terminates one browser WebRTC peer connection; pumps audio + data-channel text both ways. Talks **only** to the Model seam. Owns the transcript **Recorder** (single recording point). |
 | **Transcript** | `internal/transcript` | Session-scoped `Line{seq,role,text}` and `Recorder` — the single seq authority shared by data channel, reconnect history, and side-channel. |
-| **Offer** | `internal/offer` | SDP offer HTTP handler: rate limit, provider routing, circuit breaker, reconnect replay resolution, then `Hub.Serve`. |
+| **Offer** | `internal/offer` | SDP offer HTTP handler: rate limit, auth, circuit breaker, reconnect replay resolution, then `Hub.Serve`. |
+| **Circuit breaker** | `internal/modelcb` | Per-provider breaker on model connect (+ early stream faults via `OnModelFault`). |
+| **Auth** | `internal/auth` | Bearer → `user_id` on the offer path; fail-open anonymous. |
+| **Adaptive** | `internal/adaptive` | Optional Opus encode-complexity controller under load (`-adaptive`). |
 | **Model seam** | `internal/model` | The provider-agnostic `Model` interface (`SendAudio`/`SendText`/`Recv`/`Close`). Optional `Transcriber` (`RecvTranscript`) for STT. |
 | **Providers / adapters** | `internal/model/gemini`, `internal/model/doubao` | One concrete `Model` per streaming LLM. Each owns its WebSocket protocol and native audio format. |
 | **Side-channel** | `internal/sidechannel` | `Tap` implements `transcript.Listener`; publishes `TranscriptEvent` to Kafka/stdout using the Bridge-assigned seq. |
@@ -165,10 +300,10 @@ good enough for speech. Swap for a polyphase filter if quality ever matters.
 - **Invariant preserved:** replay is control-plane best effort; timeout/error
   never blocks media startup, and can be disabled globally with `-replay-kafka=false`.
 
-### 3.10 Model-connect circuit breaker  *(`internal/offer`, `internal/modelcb`)*
+### 3.10 Model circuit breaker  *(`internal/offer`, `internal/modelcb`, `rtc/bridge.go`)*
 
-- **Scope:** only wraps provider connect (`gemini.New` / `doubao.New`) on the
-  offer path. Established media sessions are unaffected.
+- **Scope:** gates **new** dials on the offer path (`gemini.New` / `doubao.New`).
+  Established media sessions are unaffected once connected.
 - **Policy:** fail with `503` when circuit is open/half-open gated, with
   `Retry-After`, `X-Model-CB-State`, `X-Model-CB-Reason`.
 - **State machine:** `closed -> open -> half_open -> closed`; half-open allows
@@ -176,7 +311,23 @@ good enough for speech. Swap for a polyphase filter if quality ever matters.
 - **Error sensitivity:** auth-class failures (`401/403`, unauthorized/forbidden)
   open immediately with a longer hold (`-model-cb-auth-open-for`, default 5m);
   transient failures open after `-model-cb-open-after` consecutive misses.
+- **Early stream fault:** if the provider WebSocket connects but `Recv` errors
+  before any audio within `earlyFaultWindow` (10s), `writeOutbound` calls
+  `OnModelFault` → `Breakers.Record` — catches "connected but dead on arrival"
+  without waiting for N separate offer failures.
 - **Isolation:** breakers are per provider, with optional per-provider overrides.
+
+### 3.11 Adaptive Opus complexity  *(`internal/adaptive`, `internal/audio/opus.go`)*
+
+Encode CPU dominates per-session cost (~161µs/frame at default complexity). An
+atomic complexity value is re-read each encode; controllers run off the media
+path and can only mis-pick quality, never stall a session.
+
+- **`sessions` (recommended):** proactive step function of active session count
+  with hysteresis — sheds CPU before pacing slips, no feedback loop.
+- **`drift` (experimental):** reactive on the fraction of frames ≥30ms late;
+  tracks the real SLO but can oscillate under sustained load (same hazard as
+  the reverted shared timing wheel).
 
 ## 4. Tests
 
