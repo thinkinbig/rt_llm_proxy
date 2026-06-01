@@ -17,7 +17,7 @@ func ParseProvider(raw string) (string, error) {
 	switch raw {
 	case "gemini", "":
 		return "gemini", nil
-	case "doubao", "loopback":
+	case "doubao", "loopback", "cascade":
 		return raw, nil
 	default:
 		return "", fmt.Errorf("unknown model %q", raw)
