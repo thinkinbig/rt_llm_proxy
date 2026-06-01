@@ -6,6 +6,8 @@
 // consumed by the data channel, in-memory history, and side-channel listeners.
 package transcript
 
+import "github.com/thinkinbig/rt-llm-proxy/internal/identity"
+
 // Line is one transcript turn within a session. Seq is monotonic per session
 // and is the authority for reconnect (X-Last-Seq) and side-channel ordering.
 type Line struct {
@@ -16,8 +18,8 @@ type Line struct {
 
 // SessionMeta identifies the session that produced a line.
 type SessionMeta struct {
-	SessionID string
-	UserID    string
+	SessionID identity.SessionID
+	UserID    identity.UserID
 	Provider  string
 }
 

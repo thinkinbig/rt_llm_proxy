@@ -37,6 +37,7 @@ func main() {
 	redisAddr := flag.String("redis", "", "redis address for rate limiting (empty = disabled)")
 	rlMax := flag.Int("rl-max", 10, "max sessions per client per window")
 	rlWindow := flag.Duration("rl-window", time.Minute, "rate limit window")
+	trustProxy := flag.Bool("trust-proxy", false, "trust X-Forwarded-For for the rate-limit client IP (enable only behind a reverse proxy that sets it)")
 	scMode := flag.String("sidechannel", "off", "transcript side-channel: off|stdout|kafka")
 	kafkaBrokers := flag.String("kafka", "", "kafka seed brokers (csv) for -sidechannel=kafka")
 	kafkaTopic := flag.String("kafka-topic", "transcripts", "kafka topic for transcript events")
@@ -99,12 +100,13 @@ func main() {
 	}
 
 	offerHandler := &offer.Handler{
-		Limiter:   limiter,
-		Auth:      authn,
-		Publisher: publisher,
-		Breakers:  breakers,
-		Hub:       hub,
-		Models:    offer.ProdModelFactory{},
+		Limiter:    limiter,
+		Auth:       authn,
+		Publisher:  publisher,
+		Breakers:   breakers,
+		Hub:        hub,
+		Models:     offer.ProdModelFactory{},
+		TrustProxy: *trustProxy,
 		Replay: offer.ReplayConfig{
 			Enabled: *replayKafka,
 			Timeout: *replayTimeout,
@@ -122,14 +124,19 @@ func main() {
 	defer stop()
 	go func() {
 		<-ctx.Done()
-		log.Println("shutting down: closing active sessions")
+		log.Println("shutting down")
+		// Stop accepting new offers and let in-flight handlers finish first, so
+		// no new session is added while CloseAll waits for the live ones to drain.
+		sdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(sdCtx)
+		// Tear down live sessions and wait for their goroutines to exit before
+		// closing the publisher — otherwise a late transcript Publish could race
+		// the publisher shutdown.
 		hub.CloseAll()
 		if publisher != nil {
 			publisher.Close()
 		}
-		sdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Shutdown(sdCtx)
 	}()
 
 	log.Printf("rt-llm-proxy listening on %s", *addr)

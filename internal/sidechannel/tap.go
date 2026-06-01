@@ -30,8 +30,8 @@ func (t *tap) OnLine(meta transcript.SessionMeta, line transcript.Line) {
 	t.pub.Publish(&TranscriptEvent{
 		SchemaVersion: 1,
 		EventId:       uuid.NewString(),
-		SessionId:     meta.SessionID,
-		UserId:        meta.UserID,
+		SessionId:     string(meta.SessionID),
+		UserId:        string(meta.UserID),
 		Seq:           line.Seq,
 		Role:          role,
 		Text:          line.Text,

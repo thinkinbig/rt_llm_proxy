@@ -13,12 +13,14 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 )
 
 // TokenVerifier maps an opaque bearer token to a stable user id. Implementations
 // plug in a real IdP / token format; the core server only depends on this seam.
 type TokenVerifier interface {
-	Verify(token string) (userID string, err error)
+	Verify(token string) (userID identity.UserID, err error)
 }
 
 // Authenticator resolves the user id of an incoming request via its verifier.
@@ -32,7 +34,7 @@ func New(v TokenVerifier) *Authenticator { return &Authenticator{v: v} }
 // UserID returns the request's stable user id, or "" (anonymous) if there is no
 // verifier, no bearer token, or the token fails to verify. It never errors:
 // identity failure degrades the side-channel to anonymous, it does not block.
-func (a *Authenticator) UserID(r *http.Request) string {
+func (a *Authenticator) UserID(r *http.Request) identity.UserID {
 	if a == nil || a.v == nil {
 		return ""
 	}
@@ -63,4 +65,4 @@ func bearer(r *http.Request) string {
 // a real deployment injects a verifier that validates a signed token.
 type DevVerifier struct{}
 
-func (DevVerifier) Verify(token string) (string, error) { return token, nil }
+func (DevVerifier) Verify(token string) (identity.UserID, error) { return identity.UserID(token), nil }

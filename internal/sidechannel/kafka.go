@@ -3,6 +3,7 @@ package sidechannel
 import (
 	"context"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 )
 
 // kafkaBuffer bounds the in-process queue in front of the producer. When it
@@ -28,6 +31,13 @@ type Kafka struct {
 	ch      chan *TranscriptEvent
 	done    chan struct{}
 	dropped atomic.Uint64
+
+	// mu guards closed and serializes channel sends against Close so a late
+	// Publish on a shutting-down server cannot send on a closed channel (panic).
+	// RLock lets concurrent sessions publish in parallel; Close takes the
+	// write lock once.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewKafka connects a producer and starts its drain goroutine. acks=1 trades
@@ -57,6 +67,12 @@ func NewKafka(brokers []string, topic string) (*Kafka, error) {
 // Publish enqueues an event, dropping it (and counting the drop) if the buffer
 // is full. Non-blocking by construction.
 func (k *Kafka) Publish(ev *TranscriptEvent) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.closed {
+		k.dropped.Add(1)
+		return
+	}
 	select {
 	case k.ch <- ev:
 	default:
@@ -82,8 +98,8 @@ func (k *Kafka) run() {
 // Replay reads transcript events for one session with seq > afterSeq. It is a
 // best-effort bounded scan from the tail of each topic partition, intended for
 // reconnect restore (not a full historical export).
-func (k *Kafka) Replay(ctx context.Context, sessionID, provider string, afterSeq uint64, limit int) ([]*TranscriptEvent, error) {
-	if sessionID == "" {
+func (k *Kafka) Replay(ctx context.Context, sessionID identity.SessionID, userID identity.UserID, provider string, afterSeq uint64, limit int) ([]*TranscriptEvent, error) {
+	if sessionID == "" || userID.Anonymous() {
 		return nil, nil
 	}
 	if limit <= 0 {
@@ -150,7 +166,7 @@ func (k *Kafka) Replay(ctx context.Context, sessionID, provider string, afterSeq
 			if err := proto.Unmarshal(rec.Value, ev); err != nil {
 				return
 			}
-			if ev.GetSessionId() != sessionID || ev.GetProvider() != provider || ev.GetSeq() <= afterSeq {
+			if ev.GetSessionId() != string(sessionID) || ev.GetUserId() != string(userID) || ev.GetProvider() != provider || ev.GetSeq() <= afterSeq {
 				return
 			}
 			dup := false
@@ -213,9 +229,17 @@ func partitionKey(ev *TranscriptEvent) string {
 // Dropped returns how many events have been dropped due to a full buffer.
 func (k *Kafka) Dropped() uint64 { return k.dropped.Load() }
 
-// Close stops the drain goroutine and flushes the producer.
+// Close stops the drain goroutine and flushes the producer. It is idempotent
+// and, via mu, guarantees no Publish is mid-send on k.ch when it is closed.
 func (k *Kafka) Close() error {
+	k.mu.Lock()
+	if k.closed {
+		k.mu.Unlock()
+		return nil
+	}
+	k.closed = true
 	close(k.ch)
+	k.mu.Unlock()
 	<-k.done
 	k.cl.Close()
 	return nil

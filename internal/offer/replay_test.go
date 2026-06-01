@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 	"github.com/thinkinbig/rt-llm-proxy/internal/sidechannel"
 	"github.com/thinkinbig/rt-llm-proxy/internal/transcript"
 )
@@ -81,14 +82,14 @@ type fakeStore struct {
 	resumeOK bool
 }
 
-func (f *fakeStore) SessionState(id string) (string, uint64, bool) {
+func (f *fakeStore) SessionState(id identity.SessionID, userID identity.UserID) (string, uint64, bool) {
 	if !f.known {
 		return "", 0, false
 	}
 	return f.provider, f.maxSeq, true
 }
 
-func (f *fakeStore) Resume(id, provider string, afterSeq uint64) ([]transcript.Line, []transcript.Line, uint64, bool) {
+func (f *fakeStore) Resume(id identity.SessionID, userID identity.UserID, provider string, afterSeq uint64) ([]transcript.Line, []transcript.Line, uint64, bool) {
 	if !f.resumeOK {
 		return nil, nil, 0, false
 	}
@@ -100,7 +101,7 @@ type fakeKafka struct {
 	err error
 }
 
-func (f *fakeKafka) Replay(context.Context, string, string, uint64, int) ([]*sidechannel.TranscriptEvent, error) {
+func (f *fakeKafka) Replay(context.Context, identity.SessionID, identity.UserID, string, uint64, int) ([]*sidechannel.TranscriptEvent, error) {
 	return f.evs, f.err
 }
 
@@ -111,7 +112,7 @@ func TestResolveReplayMemoryHit(t *testing.T) {
 		missing:  []transcript.Line{{Seq: 2, Role: "model", Text: "hey"}},
 		startSeq: 2,
 	}
-	out, err := ResolveReplay(context.Background(), "gemini",
+	out, err := ResolveReplay(context.Background(), "gemini", "alice",
 		ReplayHeaders{Requested: true, SessionID: "s1", LastSeq: 1},
 		ReplayConfig{Enabled: true}, store, nil, nil, "new-id")
 	if err != nil {
@@ -124,7 +125,7 @@ func TestResolveReplayMemoryHit(t *testing.T) {
 
 func TestResolveReplayProviderMismatch(t *testing.T) {
 	store := &fakeStore{known: true, provider: "gemini", maxSeq: 5}
-	out, err := ResolveReplay(context.Background(), "doubao",
+	out, err := ResolveReplay(context.Background(), "doubao", "alice",
 		ReplayHeaders{Requested: true, SessionID: "s1", LastSeq: 1},
 		ReplayConfig{Enabled: true}, store, nil, nil, "new-id")
 	if err != nil || out.Status != "miss" || out.SessionID != "new-id" {
@@ -134,7 +135,7 @@ func TestResolveReplayProviderMismatch(t *testing.T) {
 
 func TestResolveReplaySeqTooHigh(t *testing.T) {
 	store := &fakeStore{known: true, provider: "gemini", maxSeq: 2}
-	_, err := ResolveReplay(context.Background(), "gemini",
+	_, err := ResolveReplay(context.Background(), "gemini", "alice",
 		ReplayHeaders{Requested: true, SessionID: "s1", LastSeq: 5},
 		ReplayConfig{Enabled: true}, store, nil, nil, "new-id")
 	if _, ok := err.(*ProtocolInvalidError); !ok {
@@ -142,11 +143,27 @@ func TestResolveReplaySeqTooHigh(t *testing.T) {
 	}
 }
 
+func TestResolveReplayAnonymousMiss(t *testing.T) {
+	// An anonymous caller (userID == "") must never resume a session, even when
+	// the store would otherwise have a hit — anon sessions are non-reconnectable.
+	store := &fakeStore{
+		known: true, provider: "gemini", maxSeq: 5, resumeOK: true,
+		full:    []transcript.Line{{Seq: 1, Role: "user", Text: "hi"}},
+		missing: []transcript.Line{{Seq: 2, Role: "model", Text: "hey"}},
+	}
+	out, err := ResolveReplay(context.Background(), "gemini", "",
+		ReplayHeaders{Requested: true, SessionID: "s1", LastSeq: 1},
+		ReplayConfig{Enabled: true}, store, nil, nil, "new-id")
+	if err != nil || out.Status != "miss" || out.SessionID != "new-id" || len(out.ReplayLines) != 0 {
+		t.Fatalf("anon reconnect should miss: got %+v, %v", out, err)
+	}
+}
+
 func TestResolveReplayKafkaHit(t *testing.T) {
 	kafka := &fakeKafka{evs: []*sidechannel.TranscriptEvent{
 		{Seq: 2, Role: sidechannel.Role_ROLE_MODEL, Text: "hey"},
 	}}
-	out, err := ResolveReplay(context.Background(), "gemini",
+	out, err := ResolveReplay(context.Background(), "gemini", "alice",
 		ReplayHeaders{Requested: true, SessionID: "s1", LastSeq: 1},
 		ReplayConfig{Enabled: true}, &fakeStore{}, kafka, nil, "new-id")
 	if err != nil || out.Status != "kafka_hit" || out.StartSeq != 2 || len(out.ReplayLines) != 1 {

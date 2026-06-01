@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 	"github.com/thinkinbig/rt-llm-proxy/internal/sidechannel"
 	"github.com/thinkinbig/rt-llm-proxy/internal/transcript"
 )
@@ -23,7 +24,7 @@ type ReplayConfig struct {
 // ReplayHeaders are the reconnect headers from the client offer request.
 type ReplayHeaders struct {
 	Requested bool
-	SessionID string
+	SessionID identity.SessionID
 	LastSeq   uint64
 	Version   string
 	// Incomplete is true when any reconnect header was sent but SessionID or
@@ -38,15 +39,18 @@ type ProtocolInvalidError struct {
 
 func (e *ProtocolInvalidError) Error() string { return e.Message }
 
-// SessionLookup reads session state for reconnect replay.
+// SessionLookup reads session state for reconnect replay. userID is the
+// authenticated identity of the reconnecting request; implementations must only
+// return a session that belongs to that same user (ownership check).
 type SessionLookup interface {
-	SessionState(sessionID string) (provider string, maxSeq uint64, ok bool)
-	Resume(sessionID, provider string, afterSeq uint64) (full, replay []transcript.Line, startSeq uint64, ok bool)
+	SessionState(sessionID identity.SessionID, userID identity.UserID) (provider string, maxSeq uint64, ok bool)
+	Resume(sessionID identity.SessionID, userID identity.UserID, provider string, afterSeq uint64) (full, replay []transcript.Line, startSeq uint64, ok bool)
 }
 
-// KafkaReplayer loads transcript events from an external log (optional).
+// KafkaReplayer loads transcript events from an external log (optional). It must
+// only return events whose user id matches userID.
 type KafkaReplayer interface {
-	Replay(ctx context.Context, sessionID, provider string, afterSeq uint64, limit int) ([]*sidechannel.TranscriptEvent, error)
+	Replay(ctx context.Context, sessionID identity.SessionID, userID identity.UserID, provider string, afterSeq uint64, limit int) ([]*sidechannel.TranscriptEvent, error)
 }
 
 // ReplayObserver records replay attempts for metrics. Tests use a noop impl.
@@ -66,7 +70,7 @@ func (noopReplayObserver) ObserveError(string)              {}
 
 // ReplayOutcome is the reconnect transcript state applied to a new session.
 type ReplayOutcome struct {
-	SessionID      string
+	SessionID      identity.SessionID
 	StartSeq       uint64
 	InitialHistory []transcript.Line
 	ReplayLines    []transcript.Line
@@ -94,7 +98,7 @@ func ParseReplayHeaders(sessionID, lastSeqStr, version string) (ReplayHeaders, e
 	}
 	return ReplayHeaders{
 		Requested: true,
-		SessionID: sessionID,
+		SessionID: identity.SessionID(sessionID),
 		LastSeq:   lastSeq,
 		Version:   version,
 	}, nil
@@ -104,12 +108,13 @@ func ParseReplayHeaders(sessionID, lastSeqStr, version string) (ReplayHeaders, e
 func ResolveReplay(
 	ctx context.Context,
 	provider string,
+	userID identity.UserID,
 	headers ReplayHeaders,
 	cfg ReplayConfig,
 	store SessionLookup,
 	kafka KafkaReplayer,
 	obs ReplayObserver,
-	newSessionID string,
+	newSessionID identity.SessionID,
 ) (ReplayOutcome, error) {
 	if obs == nil {
 		obs = noopReplayObserver{}
@@ -124,8 +129,15 @@ func ResolveReplay(
 	if !headers.Requested || headers.Incomplete {
 		return out, nil
 	}
+	// Anonymous sessions are not reconnectable: without an authenticated
+	// identity to bind ownership to, anyone holding a session id could resume
+	// (and forcibly take over) another anonymous caller's session. Treat the
+	// reconnect as a plain miss and mint a fresh session.
+	if userID.Anonymous() {
+		return out, nil
+	}
 
-	if knownProvider, maxSeq, known := store.SessionState(headers.SessionID); known {
+	if knownProvider, maxSeq, known := store.SessionState(headers.SessionID, userID); known {
 		if headers.LastSeq > maxSeq {
 			return out, &ProtocolInvalidError{Message: "X-Last-Seq exceeds known max seq"}
 		}
@@ -136,7 +148,7 @@ func ResolveReplay(
 
 	memStart := time.Now()
 	obs.ObserveAttempt("memory")
-	if full, missing, baseSeq, ok := store.Resume(headers.SessionID, provider, headers.LastSeq); ok {
+	if full, missing, baseSeq, ok := store.Resume(headers.SessionID, userID, provider, headers.LastSeq); ok {
 		obs.ObserveHit("memory", time.Since(memStart))
 		out.SessionID = headers.SessionID
 		out.StartSeq = baseSeq
@@ -157,7 +169,7 @@ func ResolveReplay(
 	obs.ObserveAttempt("kafka")
 	kStart := time.Now()
 	replayCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	evs, err := kafka.Replay(replayCtx, headers.SessionID, provider, headers.LastSeq, cfg.Limit)
+	evs, err := kafka.Replay(replayCtx, headers.SessionID, userID, provider, headers.LastSeq, cfg.Limit)
 	cancel()
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(replayCtx.Err(), context.DeadlineExceeded) {

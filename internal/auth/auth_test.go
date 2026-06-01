@@ -4,11 +4,13 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+
+	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 )
 
 type errVerifier struct{}
 
-func (errVerifier) Verify(string) (string, error) { return "", errors.New("bad token") }
+func (errVerifier) Verify(string) (identity.UserID, error) { return "", errors.New("bad token") }
 
 func req(authHeader string) *http.Request {
 	r, _ := http.NewRequest(http.MethodPost, "/", nil)
@@ -23,7 +25,7 @@ func TestUserID(t *testing.T) {
 		name   string
 		authn  *Authenticator
 		header string
-		want   string
+		want   identity.UserID
 	}{
 		{"nil verifier is anonymous", New(nil), "Bearer alice", ""},
 		{"no header is anonymous", New(DevVerifier{}), "", ""},
