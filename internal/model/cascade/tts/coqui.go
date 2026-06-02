@@ -1,4 +1,4 @@
-package cascade
+package tts
 
 import (
 	"bytes"
@@ -11,13 +11,14 @@ import (
 	"strings"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade"
 )
 
 // chunkSamples is the PCM chunk size pushed into the channel per iteration
 // (~20ms at 48kHz, matching the RTC bridge frame cadence).
 const chunkSamples = audio.OpusRate * 20 / 1000
 
-// CoquiTTS is a TTS stage backed by a Coqui TTS server.
+// Coqui is a TTS stage backed by a Coqui TTS server.
 //
 // Coqui TTS server does not stream; it returns a complete WAV file per request.
 // We parse the WAV header to determine the native sample rate, resample to
@@ -27,15 +28,15 @@ const chunkSamples = audio.OpusRate * 20 / 1000
 //
 // Endpoint: GET/POST <baseURL>/api/tts?text=<encoded>
 // Response: audio/wav
-type CoquiTTS struct {
+type Coqui struct {
 	baseURL    string
 	httpClient *http.Client
 }
 
-// NewCoquiTTS creates a CoquiTTS that calls the server at baseURL
+// NewCoqui creates a Coqui TTS that calls the server at baseURL
 // (e.g. "http://localhost:5002").
-func NewCoquiTTS(baseURL string) *CoquiTTS {
-	return &CoquiTTS{
+func NewCoqui(baseURL string) *Coqui {
+	return &Coqui{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{},
 	}
@@ -44,7 +45,7 @@ func NewCoquiTTS(baseURL string) *CoquiTTS {
 // Synthesize requests synthesis of text, then streams the resulting PCM
 // (mono s16, 48kHz) in ~20ms chunks. The channel closes when all chunks
 // have been sent or ctx is cancelled.
-func (c *CoquiTTS) Synthesize(ctx context.Context, text string) (<-chan []int16, error) {
+func (c *Coqui) Synthesize(ctx context.Context, text string) (<-chan []int16, error) {
 	endpoint := c.baseURL + "/api/tts?text=" + url.QueryEscape(text)
 	// Retry once on transient failure before giving up.
 	var wavData []byte
@@ -99,7 +100,7 @@ func (c *CoquiTTS) Synthesize(ctx context.Context, text string) (<-chan []int16,
 	return ch, nil
 }
 
-func (c *CoquiTTS) Close() error { return nil }
+func (c *Coqui) Close() error { return nil }
 
 // parseWAV reads a minimal RIFF/WAV header and returns the PCM samples and
 // sample rate. Only handles PCM format (format tag 1), mono or stereo (we
@@ -185,3 +186,5 @@ func parseWAV(data []byte) ([]int16, int, error) {
 		}
 	}
 }
+
+var _ cascade.TTS = (*Coqui)(nil)

@@ -1,4 +1,5 @@
-package cascade
+// Package llm provides concrete cascade.LLM stage implementations.
+package llm
 
 import (
 	"bufio"
@@ -8,16 +9,18 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade"
 )
 
-// OpenAILLM is a streaming LLM stage backed by a vLLM endpoint serving
+// OpenAI is a streaming LLM stage backed by a vLLM endpoint serving
 // any model via the OpenAI-compatible chat completions API.
 //
 // Wire protocol: POST /v1/chat/completions with stream=true.
 // Server sends Server-Sent Events; each data line is a JSON chunk with
 // choices[0].delta.content holding the token text. The stream ends with
 // data: [DONE].
-type OpenAILLM struct {
+type OpenAI struct {
 	baseURL    string
 	model      string
 	httpClient *http.Client
@@ -44,10 +47,10 @@ type openAIChunk struct {
 	} `json:"choices"`
 }
 
-// NewOpenAILLM creates a OpenAILLM that calls the vLLM endpoint at
-// baseURL (e.g. "http://localhost:8000") using the given model name.
-func NewOpenAILLM(baseURL, model string) *OpenAILLM {
-	return &OpenAILLM{
+// New creates an OpenAI LLM that calls the vLLM endpoint at baseURL
+// (e.g. "http://localhost:8000") using the given model name.
+func New(baseURL, model string) *OpenAI {
+	return &OpenAI{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		model:      model,
 		httpClient: &http.Client{},
@@ -57,7 +60,7 @@ func NewOpenAILLM(baseURL, model string) *OpenAILLM {
 // Generate streams reply tokens from the vLLM endpoint. The returned channel
 // closes when the reply is complete or ctx is cancelled (barge-in).
 // On a transient error (network / 5xx) it retries once before giving up.
-func (d *OpenAILLM) Generate(ctx context.Context, history []Message) (<-chan string, error) {
+func (d *OpenAI) Generate(ctx context.Context, history []cascade.Message) (<-chan string, error) {
 	msgs := make([]openAIMessage, len(history))
 	for i, m := range history {
 		role := m.Role
@@ -138,4 +141,6 @@ func (d *OpenAILLM) Generate(ctx context.Context, history []Message) (<-chan str
 	return ch, nil
 }
 
-func (d *OpenAILLM) Close() error { return nil }
+func (d *OpenAI) Close() error { return nil }
+
+var _ cascade.LLM = (*OpenAI)(nil)

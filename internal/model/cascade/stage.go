@@ -94,3 +94,12 @@ type QuickSynthesizer interface {
 type TurnDetector interface {
 	SuggestedPause(ctx context.Context, text string) time.Duration
 }
+
+// NopTurnDetector fires the LLM immediately after ASR final (legacy behaviour).
+// It is the default when Config.TurnDetect is nil. Sidecar-backed detectors
+// live in the turndetect subpackage.
+type NopTurnDetector struct{}
+
+func (NopTurnDetector) SuggestedPause(_ context.Context, _ string) time.Duration {
+	return 0
+}

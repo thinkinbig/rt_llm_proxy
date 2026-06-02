@@ -5,6 +5,10 @@ import (
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade/asr"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade/llm"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade/tts"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade/turndetect"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model/doubao"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model/gemini"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model/loopback"
@@ -35,23 +39,23 @@ func (f ProdModelFactory) New(ctx context.Context, provider string) (model.Model
 	case "loopback":
 		return loopback.New(), nil
 	case "cascade":
-		asr, err := cascade.NewWhisperASR(f.Cascade.WhisperURL)
+		asrStage, err := asr.NewWhisper(f.Cascade.WhisperURL)
 		if err != nil {
 			return nil, err
 		}
-		tts, err := cascade.NewXTTSStreamTTS(f.Cascade.TTSURL, f.Cascade.TTSSpeaker, f.Cascade.TTSLang)
+		ttsStage, err := tts.NewXTTSStream(f.Cascade.TTSURL, f.Cascade.TTSSpeaker, f.Cascade.TTSLang)
 		if err != nil {
-			asr.Close()
+			asrStage.Close()
 			return nil, err
 		}
 		var td cascade.TurnDetector = cascade.NopTurnDetector{}
 		if f.Cascade.TurnDetectURL != "" {
-			td = cascade.NewHTTPTurnDetector(f.Cascade.TurnDetectURL)
+			td = turndetect.NewHTTP(f.Cascade.TurnDetectURL)
 		}
 		return cascade.New(ctx, cascade.Config{
-			ASR:        asr,
-			LLM:        cascade.NewOpenAILLM(f.Cascade.LLMURL, f.Cascade.LLMModel),
-			TTS:        tts,
+			ASR:        asrStage,
+			LLM:        llm.New(f.Cascade.LLMURL, f.Cascade.LLMModel),
+			TTS:        ttsStage,
 			TurnDetect: td,
 			System:     f.Cascade.System,
 		})

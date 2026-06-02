@@ -1,4 +1,7 @@
-package cascade
+// Package turndetect provides concrete cascade.TurnDetector implementations.
+// The no-op default lives in the engine package; this package holds the
+// sidecar-backed detector.
+package turndetect
 
 import (
 	"bytes"
@@ -12,23 +15,16 @@ import (
 // defaultPause is used when the sidecar is unreachable or returns an error.
 const defaultPause = 400 * time.Millisecond
 
-// NopTurnDetector fires the LLM immediately after ASR final (legacy behaviour).
-type NopTurnDetector struct{}
-
-func (NopTurnDetector) SuggestedPause(_ context.Context, _ string) time.Duration {
-	return 0
-}
-
-// HTTPTurnDetector calls the turndetect Python sidecar to get a dynamic pause.
-type HTTPTurnDetector struct {
+// HTTP calls the turndetect Python sidecar to get a dynamic pause.
+type HTTP struct {
 	url    string
 	client *http.Client
 }
 
-// NewHTTPTurnDetector creates a detector that calls baseURL (e.g.
-// "http://localhost:7000"). It times out after 200ms to stay off the hot path.
-func NewHTTPTurnDetector(baseURL string) *HTTPTurnDetector {
-	return &HTTPTurnDetector{
+// NewHTTP creates a detector that calls baseURL (e.g. "http://localhost:7000").
+// It times out after 200ms to stay off the hot path.
+func NewHTTP(baseURL string) *HTTP {
+	return &HTTP{
 		url:    strings.TrimRight(baseURL, "/") + "/detect",
 		client: &http.Client{Timeout: 200 * time.Millisecond},
 	}
@@ -42,7 +38,7 @@ type turnDetectResponse struct {
 	PauseMs int `json:"pause_ms"`
 }
 
-func (d *HTTPTurnDetector) SuggestedPause(ctx context.Context, text string) time.Duration {
+func (d *HTTP) SuggestedPause(ctx context.Context, text string) time.Duration {
 	body, _ := json.Marshal(turnDetectRequest{Text: text})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.url, bytes.NewReader(body))
 	if err != nil {

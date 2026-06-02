@@ -1,4 +1,5 @@
-package cascade
+// Package tts provides concrete cascade.TTS stage implementations.
+package tts
 
 import (
 	"bytes"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade"
 )
 
 // xttsRate is the sample rate XTTS streams on the wire (model native rate).
@@ -32,9 +34,9 @@ const (
 // shared across sessions), not once per session, so it never adds setup latency.
 var prewarmOnce sync.Once
 
-// XTTSStreamTTS is a TTS stage backed by coqui-ai/xtts-streaming-server.
+// XTTSStream is a TTS stage backed by coqui-ai/xtts-streaming-server.
 //
-// Unlike CoquiTTS (which fetches a complete WAV then chunks it), this stage
+// Unlike Coqui (which fetches a complete WAV then chunks it), this stage
 // uses the /tts_stream endpoint: XTTS emits int16 PCM incrementally as it
 // synthesises, so the first audio reaches the caller within ~100ms instead of
 // after the whole utterance is rendered. This is what makes the cascade's
@@ -48,7 +50,7 @@ var prewarmOnce sync.Once
 //
 // Speaker conditioning is fetched once at construction and reused for every
 // request (the server is stateless per call).
-type XTTSStreamTTS struct {
+type XTTSStream struct {
 	baseURL    string
 	language   string
 	embedding  []float64
@@ -74,12 +76,12 @@ type xttsStreamRequest struct {
 	StreamChunkSize  string      `json:"stream_chunk_size"`
 }
 
-// NewXTTSStreamTTS dials the xtts-streaming-server at baseURL (e.g.
+// NewXTTSStream dials the xtts-streaming-server at baseURL (e.g.
 // "http://localhost:8020"), fetches the studio speakers and caches the
 // conditioning for `speaker`. If speaker is "", the first speaker (sorted by
 // name for determinism) is used. language is the XTTS language code (e.g.
 // "en", "zh-cn").
-func NewXTTSStreamTTS(baseURL, speaker, language string) (*XTTSStreamTTS, error) {
+func NewXTTSStream(baseURL, speaker, language string) (*XTTSStream, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if language == "" {
 		language = "en"
@@ -115,7 +117,7 @@ func NewXTTSStreamTTS(baseURL, speaker, language string) (*XTTSStreamTTS, error)
 		return nil, fmt.Errorf("xtts: speaker %q not found", speaker)
 	}
 
-	x := &XTTSStreamTTS{
+	x := &XTTSStream{
 		baseURL:    baseURL,
 		language:   language,
 		embedding:  sp.SpeakerEmbedding,
@@ -130,7 +132,7 @@ func NewXTTSStreamTTS(baseURL, speaker, language string) (*XTTSStreamTTS, error)
 // background) so the XTTS server's first real utterance doesn't pay CUDA
 // cold-start cost, and logs the measured time-to-first-audio. Best-effort:
 // failures are logged and ignored. It never blocks session setup.
-func (x *XTTSStreamTTS) prewarm() {
+func (x *XTTSStream) prewarm() {
 	prewarmOnce.Do(func() {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -158,13 +160,13 @@ func (x *XTTSStreamTTS) prewarm() {
 
 // Synthesize streams PCM (mono s16, 48kHz) for text as XTTS renders it, using
 // the throughput-tuned chunk size (later segments of a turn).
-func (x *XTTSStreamTTS) Synthesize(ctx context.Context, text string) (<-chan []int16, error) {
+func (x *XTTSStream) Synthesize(ctx context.Context, text string) (<-chan []int16, error) {
 	return x.stream(ctx, text, xttsFinalChunkSize)
 }
 
 // SynthesizeQuick streams text using the small chunk size for the lowest
 // time-to-first-audio (the quick answer — first segment of a turn).
-func (x *XTTSStreamTTS) SynthesizeQuick(ctx context.Context, text string) (<-chan []int16, error) {
+func (x *XTTSStream) SynthesizeQuick(ctx context.Context, text string) (<-chan []int16, error) {
 	return x.stream(ctx, text, xttsQuickChunkSize)
 }
 
@@ -172,7 +174,7 @@ func (x *XTTSStreamTTS) SynthesizeQuick(ctx context.Context, text string) (<-cha
 // The 24kHz wire stream is resampled to 48kHz and re-framed into ~20ms chunks
 // (matching the bridge cadence) so audio flows to the caller before synthesis
 // finishes. Cancelling ctx aborts the request (barge-in).
-func (x *XTTSStreamTTS) stream(ctx context.Context, text, chunkSize string) (<-chan []int16, error) {
+func (x *XTTSStream) stream(ctx context.Context, text, chunkSize string) (<-chan []int16, error) {
 	body, err := json.Marshal(xttsStreamRequest{
 		SpeakerEmbedding: x.embedding,
 		GPTCondLatent:    x.latent,
@@ -255,9 +257,9 @@ func (x *XTTSStreamTTS) stream(ctx context.Context, text, chunkSize string) (<-c
 	return ch, nil
 }
 
-func (x *XTTSStreamTTS) Close() error { return nil }
+func (x *XTTSStream) Close() error { return nil }
 
 var (
-	_ TTS              = (*XTTSStreamTTS)(nil)
-	_ QuickSynthesizer = (*XTTSStreamTTS)(nil)
+	_ cascade.TTS              = (*XTTSStream)(nil)
+	_ cascade.QuickSynthesizer = (*XTTSStream)(nil)
 )

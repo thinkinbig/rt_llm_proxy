@@ -2,9 +2,12 @@ package cascade
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeASR struct{ events chan ASREvent }
@@ -188,6 +191,7 @@ func TestQuickAnswerUsesQuickSynthesizer(t *testing.T) {
 type fakeAudioSource struct {
 	frames [][]int16
 	pos    int
+	closed bool
 }
 
 func (f *fakeAudioSource) Read() ([]int16, error) {
@@ -198,7 +202,7 @@ func (f *fakeAudioSource) Read() ([]int16, error) {
 	f.pos++
 	return pcm, nil
 }
-func (f *fakeAudioSource) Close() error { return nil }
+func (f *fakeAudioSource) Close() error { f.closed = true; return nil }
 
 func TestSetAudioSourceTakesPriority(t *testing.T) {
 	c, _ := newTestCascade(t)
@@ -216,6 +220,155 @@ func TestSetAudioSourceTakesPriority(t *testing.T) {
 	}
 	if len(pcm) != 480 || pcm[0] != 1 {
 		t.Fatalf("expected audio source frame, got len=%d val=%d", len(pcm), pcm[0])
+	}
+}
+
+// slowLLM emits its reply after a short delay so a respond() goroutine stays
+// alive while run() keeps mutating history for later turns — the overlap that
+// exercises the history-ownership invariant. Run under -race.
+type slowLLM struct{}
+
+func (slowLLM) Generate(ctx context.Context, _ []Message) (<-chan string, error) {
+	ch := make(chan string, 1)
+	go func() {
+		defer close(ch)
+		select {
+		case <-time.After(2 * time.Millisecond):
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case ch <- "reply.":
+		case <-ctx.Done():
+		}
+	}()
+	return ch, nil
+}
+func (slowLLM) Close() error { return nil }
+
+func TestConcurrentTurnsNoHistoryRace(t *testing.T) {
+	asr := &fakeASR{events: make(chan ASREvent, 64)}
+	c, err := New(context.Background(), Config{
+		ASR: asr,
+		LLM: slowLLM{},
+		TTS: &fakeTTS{frame: make([]int16, 480)},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	// Drain audio + transcripts so respond()/run() never block on a full channel.
+	go func() {
+		for {
+			if _, err := c.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			if _, err := c.RecvTranscript(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Fire many distinct finals back-to-back; with NopTurnDetector each spawns
+	// a respond() that overlaps run()'s appends for subsequent turns.
+	for i := range 50 {
+		asr.events <- ASREvent{Kind: ASRFinal, Text: fmt.Sprintf("utterance %d", i)}
+	}
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestCloseReleasesActiveAudioSource(t *testing.T) {
+	c, _ := newTestCascade(t)
+	src := &fakeAudioSource{frames: [][]int16{make([]int16, 480)}}
+	c.SetAudioSource(src)
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !src.closed {
+		t.Fatal("Close did not release the active AudioSource")
+	}
+}
+
+// blockTTS blocks inside Synthesize until release is closed, ignoring ctx, so a
+// test can hold a respond() goroutine mid-stage while it calls Close().
+type blockTTS struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockTTS) Synthesize(context.Context, string) (<-chan []int16, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	ch := make(chan []int16)
+	close(ch)
+	return ch, nil
+}
+func (b *blockTTS) Close() error { return nil }
+
+// TestCloseWaitsForInflightRespond proves Close() is a real barrier: it must not
+// return while a respond() goroutine is still executing inside a stage.
+func TestCloseWaitsForInflightRespond(t *testing.T) {
+	asr := &fakeASR{events: make(chan ASREvent, 4)}
+	tts := &blockTTS{entered: make(chan struct{}), release: make(chan struct{})}
+	c, err := New(context.Background(), Config{
+		ASR: asr,
+		LLM: &fakeLLM{reply: "hello"},
+		TTS: tts,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	asr.events <- ASREvent{Kind: ASRFinal, Text: "hi"}
+	<-tts.entered // a respond() goroutine is now blocked inside Synthesize
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- c.Close() }()
+
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned while a respond() goroutine was still in a stage")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(tts.release) // let the stage finish
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the in-flight goroutine finished")
+	}
+}
+
+// errCloseTTS returns a fixed error from Close to verify error aggregation.
+type errCloseTTS struct{ err error }
+
+func (e errCloseTTS) Synthesize(context.Context, string) (<-chan []int16, error) {
+	ch := make(chan []int16)
+	close(ch)
+	return ch, nil
+}
+func (e errCloseTTS) Close() error { return e.err }
+
+func TestCloseAggregatesStageErrors(t *testing.T) {
+	wantErr := errors.New("tts boom")
+	asr := &fakeASR{events: make(chan ASREvent, 4)}
+	c, err := New(context.Background(), Config{
+		ASR: asr,
+		LLM: &fakeLLM{reply: "x"},
+		TTS: errCloseTTS{err: wantErr},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := c.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("Close err = %v, want it to wrap %v", err, wantErr)
 	}
 }
 

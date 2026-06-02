@@ -53,6 +53,7 @@ type Cascade struct {
 	recvCh       chan []int16          // TTS audio out -> Recv()
 	transcriptCh chan model.Transcript // user + model text -> RecvTranscript()
 	textIn       chan string           // SendText -> orchestrator (typed user turn)
+	modelTurnCh  chan string           // respond() -> run(): completed model reply to append
 
 	history []Message // touched only by the run() goroutine; no lock needed
 
@@ -84,7 +85,12 @@ type Cascade struct {
 	audioMu  sync.Mutex
 	audioSrc AudioSource
 
+	// wg tracks every goroutine the cascade spawns — run(), each respond(),
+	// and the turn-detect timers — so Close() is a real shutdown barrier.
 	wg sync.WaitGroup
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 var (
@@ -109,13 +115,13 @@ func New(ctx context.Context, cfg Config) (*Cascade, error) {
 		recvCh:       make(chan []int16, 64),
 		transcriptCh: make(chan model.Transcript, 64),
 		textIn:       make(chan string, 8),
+		modelTurnCh:  make(chan string, 8),
 		pendingCh:    make(chan struct{}, 1),
 	}
 	if cfg.System != "" {
 		c.history = append(c.history, Message{Role: "system", Text: cfg.System})
 	}
-	c.wg.Add(1)
-	go c.run()
+	c.wg.Go(c.run)
 	return c, nil
 }
 
@@ -198,17 +204,33 @@ func (c *Cascade) RecvTranscript() (model.Transcript, error) {
 	}
 }
 
+// Close cancels the pipeline, waits for every spawned goroutine to exit, then
+// releases the stages and any active audio source. It is idempotent and
+// aggregates the stages' close errors. Order matters: goroutines that call into
+// the stages (run, respond) must finish before the stages are closed.
 func (c *Cascade) Close() error {
-	c.cancel()
-	c.asr.Close()
-	c.llm.Close()
-	c.tts.Close()
-	c.wg.Wait()
-	return nil
+	c.closeOnce.Do(func() {
+		c.cancel()
+		c.wg.Wait() // run(), respond()s and timers have exited; stages are now idle
+
+		c.closeErr = errors.Join(c.asr.Close(), c.llm.Close(), c.tts.Close())
+
+		// Release any audio source still playing at teardown (every other path —
+		// SetAudioSource replacement, Recv EOF fallback — already closes it).
+		c.audioMu.Lock()
+		src := c.audioSrc
+		c.audioSrc = nil
+		c.audioMu.Unlock()
+		if src != nil {
+			c.closeErr = errors.Join(c.closeErr, src.Close())
+		}
+	})
+	return c.closeErr
 }
 
 func (c *Cascade) RecvInterrupted() (bool, error) {
-	// Cascade's barge-in is triggered by ASRSpeechStarted event, handled in orchestrate.go
+	// Cascade's barge-in is triggered by the ASRSpeechStarted event, handled
+	// in the run loop (see handleASR in turn.go).
 	return false, nil
 }
 
@@ -226,4 +248,11 @@ func (c *Cascade) setGenCancel(cancel context.CancelFunc, done chan struct{}) {
 	c.genCancel = cancel
 	c.genDone = done
 	c.genMu.Unlock()
+}
+
+func (c *Cascade) emitTranscript(role, text string) {
+	select {
+	case c.transcriptCh <- model.Transcript{Role: role, Text: text}:
+	case <-c.ctx.Done():
+	}
 }

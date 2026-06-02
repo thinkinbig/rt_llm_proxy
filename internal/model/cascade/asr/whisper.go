@@ -1,4 +1,5 @@
-package cascade
+// Package asr provides concrete cascade.ASR stage implementations.
+package asr
 
 import (
 	"context"
@@ -10,12 +11,13 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/cascade"
 )
 
 // whisperRate is the sample rate the ASR server expects on the wire.
 const whisperRate = 16000
 
-// WhisperASR is a streaming ASR stage backed by the RealtimeSTT sidecar
+// Whisper is a streaming ASR stage backed by the RealtimeSTT sidecar
 // (realtimestt/server.py — Silero/WebRTC VAD + faster-whisper).
 //
 // Wire protocol (WebSocket streaming):
@@ -25,9 +27,9 @@ const whisperRate = 16000
 //
 // Incoming audio from the cascade is 48kHz; we resample to 16kHz before
 // sending.
-type WhisperASR struct {
+type Whisper struct {
 	conn   *websocket.Conn
-	events chan ASREvent
+	events chan cascade.ASREvent
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -38,10 +40,10 @@ type whisperMsg struct {
 	Text string `json:"text"`
 }
 
-// NewWhisperASR dials the faster-whisper-server WebSocket endpoint and starts
+// NewWhisper dials the faster-whisper-server WebSocket endpoint and starts
 // the reader goroutine. url should be the full ws:// address of the streaming
 // endpoint, e.g. "ws://localhost:9000/v1/audio/transcriptions/streaming".
-func NewWhisperASR(url string) (*WhisperASR, error) {
+func NewWhisper(url string) (*Whisper, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Content-Type": []string{"audio/pcm"}},
@@ -51,9 +53,9 @@ func NewWhisperASR(url string) (*WhisperASR, error) {
 		return nil, fmt.Errorf("whisper dial %s: %w", url, err)
 	}
 
-	a := &WhisperASR{
+	a := &Whisper{
 		conn:   conn,
-		events: make(chan ASREvent, 16),
+		events: make(chan cascade.ASREvent, 16),
 		cancel: cancel,
 	}
 	a.wg.Add(1)
@@ -63,7 +65,7 @@ func NewWhisperASR(url string) (*WhisperASR, error) {
 
 // Write accepts 48kHz mono s16 PCM (the cascade contract), resamples to 16kHz,
 // and sends the bytes to faster-whisper-server as a binary WebSocket message.
-func (a *WhisperASR) Write(pcm []int16) error {
+func (a *Whisper) Write(pcm []int16) error {
 	down := audio.ResampleLinear(pcm, audio.OpusRate, whisperRate)
 	buf := make([]byte, len(down)*2)
 	for i, s := range down {
@@ -74,9 +76,9 @@ func (a *WhisperASR) Write(pcm []int16) error {
 	return a.conn.Write(ctx, websocket.MessageBinary, buf)
 }
 
-func (a *WhisperASR) Events() <-chan ASREvent { return a.events }
+func (a *Whisper) Events() <-chan cascade.ASREvent { return a.events }
 
-func (a *WhisperASR) Close() error {
+func (a *Whisper) Close() error {
 	a.cancel()
 	err := a.conn.Close(websocket.StatusNormalClosure, "")
 	a.wg.Wait()
@@ -84,7 +86,7 @@ func (a *WhisperASR) Close() error {
 }
 
 // readLoop reads JSON messages from the server and converts them to ASREvents.
-func (a *WhisperASR) readLoop(ctx context.Context) {
+func (a *Whisper) readLoop(ctx context.Context) {
 	defer a.wg.Done()
 	defer close(a.events)
 	for {
@@ -96,14 +98,14 @@ func (a *WhisperASR) readLoop(ctx context.Context) {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
-		var ev ASREvent
+		var ev cascade.ASREvent
 		switch msg.Type {
 		case "speech_start":
-			ev = ASREvent{Kind: ASRSpeechStarted}
+			ev = cascade.ASREvent{Kind: cascade.ASRSpeechStarted}
 		case "partial":
-			ev = ASREvent{Kind: ASRPartial, Text: msg.Text}
+			ev = cascade.ASREvent{Kind: cascade.ASRPartial, Text: msg.Text}
 		case "final":
-			ev = ASREvent{Kind: ASRFinal, Text: msg.Text}
+			ev = cascade.ASREvent{Kind: cascade.ASRFinal, Text: msg.Text}
 		default:
 			continue
 		}
@@ -114,3 +116,5 @@ func (a *WhisperASR) readLoop(ctx context.Context) {
 		}
 	}
 }
+
+var _ cascade.ASR = (*Whisper)(nil)
