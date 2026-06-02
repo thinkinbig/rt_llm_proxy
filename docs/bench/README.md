@@ -1,6 +1,6 @@
 # Benchmarks & capacity
 
-Durable record of the P5 measurement phase (see `../PLAN.md`). Captured on a
+Durable record of the P5 measurement phase (2026-05-31 baseline). Captured on a
 16-core box, 2026-05-31, **before** any P6 optimization, so it is the baseline
 for before/after comparison.
 

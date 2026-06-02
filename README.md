@@ -1,16 +1,29 @@
 # rt-llm-proxy
 
 Real-time LLM proxy in Go. Browsers connect over **WebRTC**; the proxy
-terminates the peer connection, decodes the Opus audio, and bridges it to a
-streaming LLM provider's WebSocket API (and back).
+terminates the peer connection, decodes Opus audio, and bridges it to a
+streaming model backend — managed STS APIs (Gemini, Doubao) or a self-hosted
+cascade (ASR → LLM → TTS).
 ```
-browser ──WebRTC(Opus audio + datachannel)──▶ proxy ──WebSocket(PCM)──▶ Gemini / Doubao
-        ◀──────────── Opus audio ────────────         ◀──── PCM ──────
+browser ──WebRTC(Opus + datachannel)──▶ proxy ──▶ gemini / doubao (WebSocket PCM)
+                                              └──▶ cascade (HTTP stages)
+        ◀──────────── Opus audio ────────────
 ```
 
 No STUN/TURN/SFU is configured (`iceServers=[]`, host candidates only) — the
 proxy is **not** NAT-traversal infrastructure. Rate limiting is optional and
 lives purely on the control plane (the SDP offer endpoint).
+
+## Quick start
+
+| Goal | Command |
+|---|---|
+| Gemini Live (local) | `export GEMINI_API_KEY=...` → `go run ./cmd/proxy` → `http://localhost:8080/demo/` |
+| Gemini Live (Docker) | `cp .env.example .env` → `docker compose up --build` |
+| Self-hosted cascade | GPU host + `PUBLIC_IP` → see [Docker Compose § cascade](#docker-compose-cascade) → `?model=cascade` |
+| Load test (no upstream) | `go run ./cmd/proxy` → `http://localhost:8080/demo/?model=loopback` |
+
+Domain terms and module seams: [`CONTEXT.md`](CONTEXT.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#cascade) (cascade: §2).
 
 ## Providers
 
@@ -64,6 +77,15 @@ Flags:
 | `-admin` | `` (off) | admin listener for `/stats` (JSON) + `/debug/pprof` |
 | `-opus-complexity` | `-1` | Opus encoder complexity 0–10 (-1 = libopus default; lower = less CPU) |
 | `-adaptive` | `off` | adaptive complexity under load: `off` \| `sessions` (recommended) \| `drift` (reactive, can oscillate) |
+| `-trust-proxy` | `false` | trust `X-Forwarded-For` for rate-limit client IP (only behind a reverse proxy that sets it) |
+| `-cascade-whisper` | `ws://localhost:9000/...` | RealtimeSTT / faster-whisper WebSocket URL (`?model=cascade`) |
+| `-cascade-llm` | `http://localhost:8000` | OpenAI-compatible LLM base URL (vLLM) |
+| `-cascade-llm-model` | `Qwen3.5-9B` | model name served by vLLM |
+| `-cascade-tts` | `http://localhost:8020` | XTTS streaming server base URL |
+| `-cascade-tts-speaker` | `` | XTTS studio speaker (empty = first available) |
+| `-cascade-tts-lang` | `en` | XTTS language code (`en`, `zh-cn`, …) |
+| `-cascade-turndetect` | `` (off) | turn-detect sidecar URL (empty = fire LLM right after ASR final) |
+| `-cascade-system` | `You are a helpful voice assistant.` | system prompt for cascade LLM |
 
 Env:
 
@@ -77,27 +99,34 @@ Env:
 - **Doubao** — `DOUBAO_APP_ID`, `DOUBAO_ACCESS_TOKEN` (开通豆包端到端实时语音大模型后获取),
   optional `DOUBAO_BOT_NAME`.
 
+<a id="cascade"></a>
+
 ## Cascade pipeline (`?model=cascade`)
 
-A self-hosted, three-stage ASR → LLM → TTS pipeline that runs alongside the
-STS providers and is selected per-session via `?model=cascade`.
+A self-hosted ASR → LLM → TTS pipeline that runs alongside the STS providers
+and is selected per-session via `?model=cascade`. The bridge sees a normal
+`Model` — same WebRTC path, transcript recorder, side-channel, and reconnect
+semantics as `gemini` / `doubao`.
+
+**Orchestrator vs sidecars:** turn orchestration lives **in-process** in
+`internal/model/cascade` (history, barge-in, LLM→TTS pipeline, business seams).
+Everything else is an **external sidecar** reached over HTTP/WebSocket — ASR,
+LLM, TTS, and optional turn-detect. The proxy container hosts only the
+orchestrator plus thin stage clients; see [ARCHITECTURE §2.1](docs/ARCHITECTURE.md#orchestrator-vs-sidecars).
 
 ```
-browser ──WebRTC(Opus)──▶ proxy ──PCM──▶ Whisper-Base (ASR)
-                                              │ transcript
-                                              ▼
-                                    vLLM / DeepSeek-R1-7B  ← LLM intercept seam
-                                              │ token stream
-                                              ▼
-                                      Coqui TTS FastPitch
-                                              │ PCM
-        ◀──Opus────────── proxy ◀─────────────┘
+browser ──WebRTC(Opus)──▶ proxy ──┬── orchestrator (in-process)
+                                  ├──▶ realtimestt/     (ASR sidecar)
+                                  ├──▶ vLLM             (LLM sidecar)
+                                  ├──▶ xtts-streaming   (TTS sidecar)
+                                  └──▶ turndetect/      (optional)
+        ◀──Opus────────── proxy ◀── PCM from orchestrator
                             ▲
                      output-mix seam (inject real tracks here)
 ```
 
-All three services are **co-located on a single GPU host** (Volcano Engine L20,
-24 GB VRAM). The proxy ↔ model hop is LAN-local (~1–5 ms), making the two
+All model stages are **co-located on a single GPU host** (e.g. Volcano Engine
+L20, 24 GB VRAM). The proxy ↔ stage hop is LAN-local (~1–5 ms), keeping the
 intercept seams cheap enough for real-time use.
 
 ### Two business seams
@@ -137,34 +166,47 @@ type AudioSource interface {
 c.SetAudioSource(NewMP3Source("track-42.mp3"))
 ```
 
-### Low-latency design: quick/final two-phase TTS
+### Low-latency design
 
-Rather than waiting for the full LLM reply before starting TTS, the cascade
-synthesizes the **first sentence** (`quick`) as soon as the LLM produces it,
-then synthesizes the **remainder** (`final`) while the quick audio is playing.
-This cuts time-to-first-audio (TTFA) to roughly one sentence worth of LLM
-latency instead of a full reply.
+Three mechanisms stack to cut time-to-first-audio (TTFA):
+
+1. **Speculative LLM start** — RealtimeSTT emits high-frequency partials. When
+   a partial looks like a complete sentence (stable for ~200 ms, ends with
+   punctuation), the cascade commits a tentative user turn and starts the LLM
+   before the ASR final arrives. If the final matches, the in-flight generation
+   continues; if not, speculation is discarded and a fresh turn starts.
+
+2. **Sentence-segmented streaming TTS** — `respond()` splits the LLM token
+   stream on sentence boundaries and synthesizes each segment while the LLM
+   keeps generating the next. With XTTS streaming, playback begins before the
+   sentence is fully rendered.
+
+3. **Turn detection (optional)** — when `-cascade-turndetect` is set, the
+   sidecar suggests a pause after each ASR final before firing the LLM, reducing
+   premature replies on trailing-off speech. When unset, the LLM starts
+   immediately after the final.
 
 ### Barge-in
 
-When the ASR detects the user starting to speak (`ASRSpeechStarted`), the
-in-flight LLM HTTP stream and TTS synthesis are cancelled immediately via
-context cancellation. The cancel sequence waits for `respond()` to exit before
-starting the new turn, preventing any race between old and new audio.
+When RealtimeSTT signals `speech_start` (user began speaking), the in-flight
+LLM HTTP stream and TTS synthesis are cancelled via context cancellation.
+`bargeIn()` waits for `respond()` to exit, then drains buffered audio — no race
+between old and new turns.
 
-Duplicate utterances (Jaccard token similarity ≥ 0.9) are ignored — the
-bot will not restart a reply it is already giving for essentially the same input.
+Duplicate utterances (Jaccard token similarity ≥ 0.9) are ignored.
 
-### Self-hosted services required
+### Self-hosted sidecars
 
-| Service | Recommended | Env / flag |
+| Sidecar | Default in compose | Flag |
 |---|---|---|
-| ASR | [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) (Whisper Base) | `-whisper-url ws://localhost:9000/...` |
-| LLM | [vLLM](https://github.com/vllm-project/vllm) serving DeepSeek-R1-7B INT8 | `-llm-url http://localhost:8000` |
-| TTS | [Coqui TTS](https://github.com/coqui-ai/TTS) server (FastPitch) | `-tts-url http://localhost:5002` |
+| ASR | `realtimestt/` — Silero VAD + faster-whisper (partials, finals, barge-in) | `-cascade-whisper` |
+| LLM | [vLLM](https://github.com/vllm-project/vllm) OpenAI API, Qwen3.5-9B | `-cascade-llm`, `-cascade-llm-model` |
+| TTS | [xtts-streaming-server](https://github.com/coqui-ai/xtts-streaming-server) | `-cascade-tts`, `-cascade-tts-speaker`, `-cascade-tts-lang` |
+| Turn detect | `turndetect/` — sentence-finished classifier (optional) | `-cascade-turndetect` |
 
-> All three fit on a single L20 (24 GB): Whisper-Base ~1.5 GB + DeepSeek-R1-7B
-> INT8 ~7 GB + Coqui TTS ~2 GB + overhead ≈ 13 GB total.
+> On a single L20 (24 GB): RealtimeSTT (base + tiny) + Qwen3.5-9B + XTTS v2 +
+> turndetect (CPU) fits with headroom when weights are mounted locally (no
+> HuggingFace download at runtime for the LLM).
 
 ### Fault tolerance
 
@@ -186,9 +228,16 @@ internal/model/     Model seam (interface only)
 internal/model/gemini/   Gemini Live adapter
 internal/model/doubao/    Doubao realtime dialogue adapter
 internal/model/cascade/   ASR→LLM→TTS cascade pipeline (two seams, barge-in)
+internal/model/cascade/asr/   streaming Whisper ASR adapter
+internal/model/cascade/llm/   OpenAI-compatible LLM adapter (vLLM)
+internal/model/cascade/tts/   XTTS streaming TTS adapter
+internal/model/cascade/turndetect/  optional turn-end sidecar
 internal/model/cascade/fakestage/  network-free stubs for tests
 internal/model/loopback/  fake provider (sine tone) for load testing
 internal/model/pcm/      shared s16le serialize (uplink bytes)
+internal/replayindex/     replay-index HTTP client + store (used by cmd/replay)
+realtimestt/              RealtimeSTT sidecar (Docker)
+turndetect/               turn-detect sidecar (Docker)
 internal/audio/     Opus encode/decode (libopus) + linear resampler
 internal/auth/      Authenticator seam (bearer -> user id, fail-open anonymous)
 internal/sidechannel/    transcript tap -> Kafka (protobuf, off the media path)
@@ -199,8 +248,11 @@ demo/               minimal browser client
 docs/               architecture & engineering notes
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module seams, the
-48kHz mono PCM audio contract, and the rationale behind each optimization.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#cascade) for module seams, the
+48kHz mono PCM audio contract, cascade orchestration (§2), and the rationale
+behind each optimization.
+
+<a id="docker-compose"></a>
 
 ## Docker Compose
 
@@ -220,12 +272,24 @@ Optional overlays (same `-f` pattern for each):
 | `docker-compose.redis.yml` | Redis + SDP offer rate limiting (`-redis`) |
 | `docker-compose.kafka.yml` | Kafka + transcript side-channel (`-sidechannel=kafka`) |
 | `docker-compose.redis-kafka.yml` | Both (use this instead of stacking redis + kafka) |
+| `docker-compose.cascade.yml` | Full cascade stack: RealtimeSTT + vLLM/Qwen + XTTS + turndetect + proxy |
 | `docker-compose.cn.yml` | `goproxy.cn` for the image build |
+
+<a id="docker-compose-cascade"></a>
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.redis.yml up --build
 docker compose -f docker-compose.yml -f docker-compose.kafka.yml up --build
+
+# Cascade (?model=cascade) — needs NVIDIA GPU + PUBLIC_IP for WebRTC
+export PUBLIC_IP=<host reachable from browser>
+export QWEN_MODEL_PATH=/path/to/Qwen3.5-9B   # optional; default mounts WebHarness cache
+docker compose -f docker-compose.yml -f docker-compose.cascade.yml up --build
+# open http://<PUBLIC_IP>:8080/demo/?model=cascade
 ```
+
+Open **TCP 8080** and **UDP 10000–60000** on the host security group. Only the
+proxy is exposed; ASR/LLM/TTS/turndetect stay on the internal Docker network.
 
 **China** — `proxy.golang.org` / `goproxy.io` slow in Docker; add the CN overlay
 or set `GOPROXY` in `.env`:
@@ -234,6 +298,8 @@ or set `GOPROXY` in `.env`:
 docker compose -f docker-compose.yml -f docker-compose.cn.yml up --build
 # or: GOPROXY=https://goproxy.cn,direct docker compose up --build
 ```
+
+<a id="scaling-failover"></a>
 
 ## Scaling & failover
 
@@ -265,9 +331,10 @@ replayable Kafka log keyed by `user_id` with a monotonic `seq`, and `session_id`
 is server-minted. With `-replay-url` set, the proxy queries the replay-index
 service for events after `last_seq`.
 The hard caveat:
-the *provider's* dialogue context (Gemini/Doubao) lives in their server-side
-socket, so we can restore our session metadata and transcribed text, but cannot
-guarantee the upstream model resumes mid-thought.
+the *provider's* dialogue context (Gemini/Doubao upstream sockets, cascade
+LLM history on the GPU host) lives outside the replay log, so we can restore
+session metadata and transcribed text, but cannot guarantee the model resumes
+mid-thought.
 
 Reconnect protocol notes:
 

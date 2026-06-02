@@ -14,9 +14,8 @@ enum Role {
 // TranscriptEvent is one transcript line tapped off the media bridge and
 // published to the side-channel for personalization. It never carries audio.
 //
-// Delivery is at-most-once and lossy under pressure (see ARCHITECTURE /
-// docs/PLAN.md): `seq` is monotonic per session so a consumer can detect the
-// gaps we drop.
+// Delivery is at-most-once and lossy under pressure (see docs/ARCHITECTURE.md §1.4):
+// `seq` is monotonic per session so a consumer can detect the gaps we drop.
 message TranscriptEvent {
   uint32 schema_version = 1; // 1
   string event_id = 2;       // uuid, for consumer-side idempotent dedup

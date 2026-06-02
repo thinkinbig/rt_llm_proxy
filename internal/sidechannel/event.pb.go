@@ -74,9 +74,8 @@ func (Role) EnumDescriptor() ([]byte, []int) {
 // TranscriptEvent is one transcript line tapped off the media bridge and
 // published to the side-channel for personalization. It never carries audio.
 //
-// Delivery is at-most-once and lossy under pressure (see ARCHITECTURE /
-// docs/PLAN.md): `seq` is monotonic per session so a consumer can detect the
-// gaps we drop.
+// Delivery is at-most-once and lossy under pressure (see docs/ARCHITECTURE.md §1.4):
+// `seq` is monotonic per session so a consumer can detect the gaps we drop.
 type TranscriptEvent struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SchemaVersion uint32                 `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"` // 1
