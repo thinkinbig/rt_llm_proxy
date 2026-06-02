@@ -28,6 +28,13 @@ const (
 	geminiWSURL   = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 )
 
+// VADConfig controls voice activity detection settings.
+type VADConfig struct {
+	Enabled             bool
+	StartOfSpeechSensitivity float64
+	EndOfSpeechSensitivity   float64
+}
+
 // --- wire format (BidiGenerateContent JSON over WS) ---
 // Field names match the google-genai SDK / v1beta proto JSON. The realtimeInput
 // shape is version-sensitive: older servers want "mediaChunks", newer ones also
@@ -39,6 +46,11 @@ type geminiSetup struct {
 		GenerationConfig struct {
 			ResponseModalities []string `json:"responseModalities"`
 		} `json:"generationConfig"`
+		RealtimeInputConfig struct {
+			AutomaticActivityDetection *struct {
+				Disabled bool `json:"disabled,omitempty"`
+			} `json:"automaticActivityDetection,omitempty"`
+		} `json:"realtimeInputConfig,omitempty"`
 		InputAudioTranscription  struct{} `json:"inputAudioTranscription"`
 		OutputAudioTranscription struct{} `json:"outputAudioTranscription"`
 	} `json:"setup"`
@@ -78,6 +90,7 @@ type geminiServerMsg struct {
 	OutputTranscription *geminiTranscription `json:"outputTranscription"`
 	ServerContent       *struct {
 		TurnComplete        bool                 `json:"turnComplete"`
+		Interrupted         bool                 `json:"interrupted"`
 		InputTranscription  *geminiTranscription `json:"inputTranscription"`
 		OutputTranscription *geminiTranscription `json:"outputTranscription"`
 		ModelTurn           *struct {
@@ -97,15 +110,27 @@ type Gemini struct {
 	wg     sync.WaitGroup // readLoop; Close waits on it
 	recvCh chan []int16
 	textCh chan model.Transcript
+	vadCfg VADConfig
 
 	// Transcription arrives as deltas; we accumulate per role so the data
 	// channel carries the full sentence so far (the browser replaces the bubble
 	// body on each line). Reset at turn boundaries. Touched only by readLoop.
-	userBuf  strings.Builder
-	modelBuf strings.Builder
+	userBuf      strings.Builder
+	modelBuf     strings.Builder
+	interruptedCh chan struct{} // Signals user speech interruption from server
 }
 
 func New(ctx context.Context) (*Gemini, error) {
+	// VAD enabled by default; set VAD_ENABLED=false to disable
+	enabled := os.Getenv("VAD_ENABLED") != "false"
+	return NewWithVAD(ctx, VADConfig{
+		Enabled:                  enabled,
+		StartOfSpeechSensitivity: 0.5,
+		EndOfSpeechSensitivity:   0.5,
+	})
+}
+
+func NewWithVAD(ctx context.Context, vadCfg VADConfig) (*Gemini, error) {
 	key := os.Getenv("GEMINI_API_KEY")
 	if key == "" {
 		key = os.Getenv("GOOGLE_API_KEY")
@@ -115,9 +140,6 @@ func New(ctx context.Context) (*Gemini, error) {
 	}
 	modelName := os.Getenv("GEMINI_MODEL")
 	if modelName == "" {
-		// Must support bidiGenerateContent. Verify with:
-		//   curl ".../v1beta/models?key=$KEY&pageSize=200" | jq '.models[]
-		//     | select(.supportedGenerationMethods[]?=="bidiGenerateContent").name'
 		modelName = "models/gemini-2.5-flash-native-audio-latest"
 	}
 
@@ -127,12 +149,12 @@ func New(ctx context.Context) (*Gemini, error) {
 		cancel()
 		return nil, fmt.Errorf("gemini: dial: %w", err)
 	}
-	// Audio messages from the server are large; lift the default 32KB read cap.
 	conn.SetReadLimit(16 << 20)
 
 	g := &Gemini{
-		ctx: cctx, cancel: cancel, conn: conn,
+		ctx: cctx, cancel: cancel, conn: conn, vadCfg: vadCfg,
 		recvCh: make(chan []int16, 64), textCh: make(chan model.Transcript, 64),
+		interruptedCh: make(chan struct{}, 1),
 	}
 
 	var setup geminiSetup
@@ -140,6 +162,14 @@ func New(ctx context.Context) (*Gemini, error) {
 	setup.Setup.GenerationConfig.ResponseModalities = []string{"AUDIO"}
 	setup.Setup.InputAudioTranscription = struct{}{}
 	setup.Setup.OutputAudioTranscription = struct{}{}
+	// Live API expects automaticActivityDetection to be an object (not a bool).
+	// Keep server-side auto VAD by default (omit the field entirely). Only send
+	// explicit config for manual VAD mode.
+	if !vadCfg.Enabled {
+		setup.Setup.RealtimeInputConfig.AutomaticActivityDetection = &struct {
+			Disabled bool `json:"disabled,omitempty"`
+		}{Disabled: true}
+	}
 	if err := g.writeJSON(setup); err != nil {
 		g.Close()
 		return nil, fmt.Errorf("gemini: setup: %w", err)
@@ -210,6 +240,46 @@ func (g *Gemini) RecvTranscript() (model.Transcript, error) {
 	}
 }
 
+func (g *Gemini) RecvInterrupted() (bool, error) {
+	select {
+	case <-g.ctx.Done():
+		return false, io.EOF
+	case <-g.interruptedCh:
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (g *Gemini) SupportsInterruption() bool {
+	return g.vadCfg.Enabled
+}
+
+func (g *Gemini) HandleInterrupted() error {
+	// Gemini sends an interruption signal, but we may still have already-buffered
+	// audio chunks queued locally. Drain them so barge-in feels immediate.
+	g.drainAudioQueue()
+	return nil
+}
+
+func (g *Gemini) drainAudioQueue() {
+	for {
+		select {
+		case <-g.recvCh:
+		default:
+			return
+		}
+	}
+}
+
+func (g *Gemini) signalInterrupted() {
+	g.drainAudioQueue()
+	select {
+	case g.interruptedCh <- struct{}{}:
+	default:
+	}
+}
+
 func (g *Gemini) emitText(role, text string) {
 	if text == "" {
 		return
@@ -230,6 +300,7 @@ func (g *Gemini) readLoop() {
 	defer g.wg.Done()
 	defer close(g.recvCh)
 	defer close(g.textCh)
+	defer close(g.interruptedCh)
 	first := true
 	for {
 		_, data, err := g.conn.Read(g.ctx)
@@ -252,6 +323,9 @@ func (g *Gemini) readLoop() {
 		}
 		g.handleTranscription("user", msg.ServerContent.InputTranscription)
 		g.handleTranscription("model", msg.ServerContent.OutputTranscription)
+		if msg.ServerContent.Interrupted {
+			g.signalInterrupted()
+		}
 		if msg.ServerContent.TurnComplete {
 			g.userBuf.Reset()
 			g.modelBuf.Reset()

@@ -97,3 +97,21 @@ func TestPreservesEnglishOutputSpaces(t *testing.T) {
 		t.Fatalf("second: got %+v", got)
 	}
 }
+
+func TestHandleInterruptedDrainsQueuedAudio(t *testing.T) {
+	g := &Gemini{
+		ctx:    context.Background(),
+		recvCh: make(chan []int16, 4),
+	}
+	g.recvCh <- []int16{1, 2}
+	g.recvCh <- []int16{3, 4}
+
+	if err := g.HandleInterrupted(); err != nil {
+		t.Fatalf("HandleInterrupted error: %v", err)
+	}
+	select {
+	case <-g.recvCh:
+		t.Fatal("expected recvCh to be drained after interruption")
+	default:
+	}
+}

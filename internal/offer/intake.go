@@ -59,6 +59,10 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Model sessions outlive the HTTP request/response exchange. Detach model
+	// dialing from request cancellation so the media bridge doesn't inherit an
+	// already-finished request context and tear down immediately.
+	modelCtx := context.WithoutCancel(ctx)
 	obs := in.Observer
 	if obs == nil {
 		obs = metricsReplayObserver{}
@@ -81,7 +85,7 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 		return circuitReject(d)
 	}
 
-	m, err := in.Models.New(ctx, provider)
+	m, err := in.Models.New(modelCtx, provider)
 	in.Guard.RecordDial(provider, err, now)
 	if err != nil {
 		log.Printf("model connect: %v", err)

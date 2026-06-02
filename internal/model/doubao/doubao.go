@@ -167,6 +167,21 @@ func (d *Doubao) RecvTranscript() (model.Transcript, error) {
 	}
 }
 
+func (d *Doubao) RecvInterrupted() (bool, error) {
+	// TODO: Implement when Doubao's VAD/barge-in API details are confirmed
+	return false, nil
+}
+
+func (d *Doubao) SupportsInterruption() bool {
+	// TODO: Enable after verifying Doubao's VAD configuration
+	return false
+}
+
+func (d *Doubao) HandleInterrupted() error {
+	// TODO: Implement Doubao-specific interruption handling
+	return nil
+}
+
 func (d *Doubao) emitTranscript(role, text string, final bool) {
 	if text == "" && !final {
 		return

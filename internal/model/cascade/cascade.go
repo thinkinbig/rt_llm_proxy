@@ -124,6 +124,20 @@ func (c *Cascade) Close() error {
 	return nil
 }
 
+func (c *Cascade) RecvInterrupted() (bool, error) {
+	// Cascade's barge-in is triggered by ASRSpeechStarted event, handled in orchestrate.go
+	return false, nil
+}
+
+func (c *Cascade) SupportsInterruption() bool {
+	return true
+}
+
+func (c *Cascade) HandleInterrupted() error {
+	c.bargeIn()
+	return nil
+}
+
 func (c *Cascade) setGenCancel(cancel context.CancelFunc) {
 	c.genMu.Lock()
 	c.genCancel = cancel

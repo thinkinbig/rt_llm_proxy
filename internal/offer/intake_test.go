@@ -19,22 +19,33 @@ type fakeModel struct {
 	closeCount int
 }
 
-func (f *fakeModel) SendAudio([]int16) error { return nil }
-func (f *fakeModel) SendText(string) error   { return nil }
-func (f *fakeModel) Recv() ([]int16, error)  { return nil, io.EOF }
+func (f *fakeModel) SendAudio([]int16) error        { return nil }
+func (f *fakeModel) SendText(string) error          { return nil }
+func (f *fakeModel) Recv() ([]int16, error)         { return nil, io.EOF }
+func (f *fakeModel) RecvInterrupted() (bool, error) { return false, nil }
+func (f *fakeModel) SupportsInterruption() bool     { return false }
+func (f *fakeModel) HandleInterrupted() error       { return nil }
 func (f *fakeModel) Close() error {
 	f.closeCount++
 	return nil
 }
 
 type fakeFactory struct {
-	m    model.Model
-	err  error
-	newN int
+	m               model.Model
+	err             error
+	newN            int
+	lastCtxCanceled bool
 }
 
-func (f *fakeFactory) New(context.Context, string) (model.Model, error) {
+func (f *fakeFactory) New(ctx context.Context, _ string) (model.Model, error) {
 	f.newN++
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			f.lastCtxCanceled = true
+		default:
+		}
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -188,5 +199,30 @@ func TestIntakeUnknownModel(t *testing.T) {
 	})
 	if res.Status != 400 {
 		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestIntakeDetachesModelContextFromCanceledRequest(t *testing.T) {
+	factory := &fakeFactory{m: &fakeModel{}}
+	in := Intake{
+		Limiter: ratelimit.New("", 0, time.Minute),
+		Guard:   modelcb.New(modelcb.Config{}, nil),
+		Models:  factory,
+		Hub:     &fakeHub{},
+	}
+	reqCtx, cancel := context.WithCancel(context.Background())
+	cancel() // Simulate an HTTP request context that already ended.
+
+	res := in.ServeOffer(IntakeRequest{
+		Ctx:      reqCtx,
+		ClientIP: "1.2.3.4",
+		Model:    "gemini",
+		OfferSDP: []byte("sdp"),
+	})
+	if res.Status != 200 {
+		t.Fatalf("got %+v", res)
+	}
+	if factory.lastCtxCanceled {
+		t.Fatalf("model factory received canceled context")
 	}
 }

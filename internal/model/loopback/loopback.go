@@ -74,6 +74,18 @@ func (m *Model) RecvTranscript() (model.Transcript, error) {
 	}
 }
 
+func (m *Model) RecvInterrupted() (bool, error) {
+	return false, nil
+}
+
+func (m *Model) SupportsInterruption() bool {
+	return false
+}
+
+func (m *Model) HandleInterrupted() error {
+	return nil
+}
+
 func (m *Model) Close() error {
 	select {
 	case <-m.closed:

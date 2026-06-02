@@ -18,6 +18,9 @@ type Transcript struct {
 // transcripts to the browser data channel.
 type Transcriber interface {
 	RecvTranscript() (Transcript, error)
+	// RecvInterrupted checks if the model detected user speech interruption (barge-in).
+	// Returns (true, nil) if interrupted, (false, nil) if not, or (_, err) on error.
+	RecvInterrupted() (bool, error)
 }
 
 type Model interface {
@@ -29,4 +32,9 @@ type Model interface {
 	// Returns io.EOF when the session is closed.
 	Recv() ([]int16, error)
 	Close() error
+	// SupportsInterruption returns true if the model natively supports VAD-based interruption.
+	SupportsInterruption() bool
+	// HandleInterrupted is called when user speech is detected during model reply.
+	// Implementations should cancel in-flight generation and drain queued audio.
+	HandleInterrupted() error
 }

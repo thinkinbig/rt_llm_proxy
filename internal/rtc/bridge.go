@@ -337,6 +337,13 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 	// Outbound pump: model audio -> browser.
 	h.wg.Go(func() { writeOutbound(scope.mediaCtx(), out, m, reportStreamFault, info.ID) })
 
+	// VAD interruption monitor: if model supports interruption, listen for barge-in.
+	if m.SupportsInterruption() {
+		if t, ok := m.(model.Transcriber); ok {
+			h.wg.Go(func() { monitorInterruption(scope.mediaCtx(), t) })
+		}
+	}
+
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer, SDP: offerSDP,
 	}); err != nil {
@@ -354,6 +361,29 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 
 	scope.commit()
 	return pc.LocalDescription().SDP, nil
+}
+
+func monitorInterruption(ctx context.Context, t model.Transcriber) {
+	ticker := time.NewTicker(10 * time.Millisecond) // Poll for interruption at 100Hz
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			interrupted, err := t.RecvInterrupted()
+			if err != nil {
+				return
+			}
+			if interrupted {
+				if m, ok := t.(model.Model); ok {
+					if err := m.HandleInterrupted(); err != nil {
+						log.Printf("rtc: handle interrupted error: %v", err)
+					}
+				}
+			}
+		}
+	}
 }
 
 func readInbound(track *webrtc.TrackRemote, m model.Model) {
