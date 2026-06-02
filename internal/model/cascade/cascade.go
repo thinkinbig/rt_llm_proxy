@@ -14,15 +14,17 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 )
 
 // Config wires the three stages. New requires all three to be non-nil.
 type Config struct {
-	ASR    ASR
-	LLM    LLM
-	TTS    TTS
+	ASR         ASR
+	LLM         LLM
+	TTS         TTS
+	TurnDetect  TurnDetector // nil → NopTurnDetector (fire immediately)
 	System string // optional system prompt, seeded as history[0]
 
 	// OnLLMToken is called for each token emitted by the LLM before it is
@@ -45,6 +47,7 @@ type Cascade struct {
 	asr        ASR
 	llm        LLM
 	tts        TTS
+	turnDetect TurnDetector
 	onLLMToken func(token, accumulated string) (string, bool)
 
 	recvCh       chan []int16          // TTS audio out -> Recv()
@@ -58,6 +61,23 @@ type Cascade struct {
 	genMu     sync.Mutex
 	genCancel context.CancelFunc
 	genDone   chan struct{}
+
+	// pending turn-end timer: owned exclusively by the run() goroutine (no lock).
+	// schedulePending() replaces it; cancelPending() stops it; run() reads pendingCh.
+	pendingCh     chan struct{}
+	pendingCancel context.CancelFunc
+
+	// speculative execution state: true when the last history entry is a
+	// tentative user turn committed from a stable partial (not yet ASR-final).
+	// Only touched by the run() goroutine.
+	speculativeActive bool
+
+	// partial stability tracker (run() goroutine only).
+	partialStab struct {
+		text      string
+		count     int
+		firstSeen time.Time
+	}
 
 	// output-mix seam: when non-nil, Recv() reads from audioSrc instead of
 	// recvCh. Falls back to recvCh on io.EOF.
@@ -76,14 +96,20 @@ func New(ctx context.Context, cfg Config) (*Cascade, error) {
 	if cfg.ASR == nil || cfg.LLM == nil || cfg.TTS == nil {
 		return nil, errors.New("cascade: ASR, LLM and TTS stages are all required")
 	}
+	td := cfg.TurnDetect
+	if td == nil {
+		td = NopTurnDetector{}
+	}
 	cctx, cancel := context.WithCancel(ctx)
 	c := &Cascade{
 		ctx: cctx, cancel: cancel,
 		asr: cfg.ASR, llm: cfg.LLM, tts: cfg.TTS,
+		turnDetect:   td,
 		onLLMToken:   cfg.OnLLMToken,
 		recvCh:       make(chan []int16, 64),
 		transcriptCh: make(chan model.Transcript, 64),
 		textIn:       make(chan string, 8),
+		pendingCh:    make(chan struct{}, 1),
 	}
 	if cfg.System != "" {
 		c.history = append(c.history, Message{Role: "system", Text: cfg.System})

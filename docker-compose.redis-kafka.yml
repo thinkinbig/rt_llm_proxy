@@ -13,7 +13,7 @@ services:
       - -redis
       - redis:6379
       - -rl-max
-      - "10"
+      - "200"
       - -rl-window
       - 1m
       - -sidechannel

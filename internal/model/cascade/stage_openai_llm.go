@@ -10,14 +10,14 @@ import (
 	"strings"
 )
 
-// DeepSeekLLM is a streaming LLM stage backed by a vLLM endpoint serving
-// DeepSeek-R1 via the OpenAI-compatible chat completions API.
+// OpenAILLM is a streaming LLM stage backed by a vLLM endpoint serving
+// any model via the OpenAI-compatible chat completions API.
 //
 // Wire protocol: POST /v1/chat/completions with stream=true.
 // Server sends Server-Sent Events; each data line is a JSON chunk with
 // choices[0].delta.content holding the token text. The stream ends with
 // data: [DONE].
-type DeepSeekLLM struct {
+type OpenAILLM struct {
 	baseURL    string
 	model      string
 	httpClient *http.Client
@@ -44,10 +44,10 @@ type openAIChunk struct {
 	} `json:"choices"`
 }
 
-// NewDeepSeekLLM creates a DeepSeekLLM that calls the vLLM endpoint at
+// NewOpenAILLM creates a OpenAILLM that calls the vLLM endpoint at
 // baseURL (e.g. "http://localhost:8000") using the given model name.
-func NewDeepSeekLLM(baseURL, model string) *DeepSeekLLM {
-	return &DeepSeekLLM{
+func NewOpenAILLM(baseURL, model string) *OpenAILLM {
+	return &OpenAILLM{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		model:      model,
 		httpClient: &http.Client{},
@@ -57,7 +57,7 @@ func NewDeepSeekLLM(baseURL, model string) *DeepSeekLLM {
 // Generate streams reply tokens from the vLLM endpoint. The returned channel
 // closes when the reply is complete or ctx is cancelled (barge-in).
 // On a transient error (network / 5xx) it retries once before giving up.
-func (d *DeepSeekLLM) Generate(ctx context.Context, history []Message) (<-chan string, error) {
+func (d *OpenAILLM) Generate(ctx context.Context, history []Message) (<-chan string, error) {
 	msgs := make([]openAIMessage, len(history))
 	for i, m := range history {
 		role := m.Role
@@ -73,7 +73,7 @@ func (d *DeepSeekLLM) Generate(ctx context.Context, history []Message) (<-chan s
 		Stream:   true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("deepseek marshal: %w", err)
+		return nil, fmt.Errorf("openai_llm marshal: %w", err)
 	}
 
 	var resp *http.Response
@@ -81,7 +81,7 @@ func (d *DeepSeekLLM) Generate(ctx context.Context, history []Message) (<-chan s
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 			d.baseURL+"/v1/chat/completions", bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("deepseek request: %w", err)
+			return nil, fmt.Errorf("openai_llm request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 
@@ -94,9 +94,9 @@ func (d *DeepSeekLLM) Generate(ctx context.Context, history []Message) (<-chan s
 		}
 		if attempt == 1 {
 			if err != nil {
-				return nil, fmt.Errorf("deepseek http (retry exhausted): %w", err)
+				return nil, fmt.Errorf("openai_llm http (retry exhausted): %w", err)
 			}
-			return nil, fmt.Errorf("deepseek status %d (retry exhausted)", resp.StatusCode)
+			return nil, fmt.Errorf("openai_llm status %d (retry exhausted)", resp.StatusCode)
 		}
 		// transient — retry once
 	}
@@ -138,4 +138,4 @@ func (d *DeepSeekLLM) Generate(ctx context.Context, history []Message) (<-chan s
 	return ch, nil
 }
 
-func (d *DeepSeekLLM) Close() error { return nil }
+func (d *OpenAILLM) Close() error { return nil }

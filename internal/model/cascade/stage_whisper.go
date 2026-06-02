@@ -12,12 +12,13 @@ import (
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
 )
 
-// whisperRate is the sample rate faster-whisper-server expects on the wire.
+// whisperRate is the sample rate the ASR server expects on the wire.
 const whisperRate = 16000
 
-// WhisperASR is a streaming ASR stage backed by faster-whisper-server.
+// WhisperASR is a streaming ASR stage backed by the RealtimeSTT sidecar
+// (realtimestt/server.py — Silero/WebRTC VAD + faster-whisper).
 //
-// Wire protocol (faster-whisper-server v0.x WebSocket streaming):
+// Wire protocol (WebSocket streaming):
 //   - Client sends raw 16kHz mono s16le PCM frames as binary messages.
 //   - Server sends JSON messages: {"type":"...","text":"..."}
 //     type = "partial" | "final" | "speech_start" | "speech_end"

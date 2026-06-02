@@ -13,11 +13,14 @@ import (
 // CascadeConfig holds the self-hosted service URLs for the cascade pipeline.
 // Populated from CLI flags and passed in at startup.
 type CascadeConfig struct {
-	WhisperURL string // faster-whisper-server WebSocket endpoint
-	LLMURL     string // vLLM base URL
-	LLMModel   string // model name served by vLLM
-	TTSURL     string // Coqui TTS server base URL
-	System     string // system prompt
+	WhisperURL    string // streaming ASR WebSocket endpoint (RealtimeSTT sidecar)
+	LLMURL        string // vLLM base URL
+	LLMModel      string // model name served by vLLM
+	TTSURL        string // xtts-streaming-server base URL
+	TTSSpeaker    string // XTTS studio speaker name (empty = first available)
+	TTSLang       string // XTTS language code (e.g. "en", "zh-cn")
+	TurnDetectURL string // turn-detect sidecar (empty = fire immediately)
+	System        string // system prompt
 }
 
 // ProdModelFactory connects real provider adapters for production wiring.
@@ -36,11 +39,21 @@ func (f ProdModelFactory) New(ctx context.Context, provider string) (model.Model
 		if err != nil {
 			return nil, err
 		}
+		tts, err := cascade.NewXTTSStreamTTS(f.Cascade.TTSURL, f.Cascade.TTSSpeaker, f.Cascade.TTSLang)
+		if err != nil {
+			asr.Close()
+			return nil, err
+		}
+		var td cascade.TurnDetector = cascade.NopTurnDetector{}
+		if f.Cascade.TurnDetectURL != "" {
+			td = cascade.NewHTTPTurnDetector(f.Cascade.TurnDetectURL)
+		}
 		return cascade.New(ctx, cascade.Config{
-			ASR:    asr,
-			LLM:    cascade.NewDeepSeekLLM(f.Cascade.LLMURL, f.Cascade.LLMModel),
-			TTS:    cascade.NewCoquiTTS(f.Cascade.TTSURL),
-			System: f.Cascade.System,
+			ASR:        asr,
+			LLM:        cascade.NewOpenAILLM(f.Cascade.LLMURL, f.Cascade.LLMModel),
+			TTS:        tts,
+			TurnDetect: td,
+			System:     f.Cascade.System,
 		})
 	default:
 		return gemini.New(ctx)

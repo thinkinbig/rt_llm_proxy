@@ -3,6 +3,7 @@ package cascade
 import (
 	"context"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
@@ -33,6 +34,8 @@ func (c *Cascade) run() {
 				return
 			}
 			lastUserText = c.handleASR(ev, lastUserText)
+		case <-c.pendingCh:
+			go c.respond()
 		case text := <-c.textIn:
 			if jaccard(text, lastUserText) >= similarityThreshold {
 				continue // duplicate typed turn — ignore
@@ -48,34 +51,148 @@ func (c *Cascade) run() {
 // handleASR processes one ASR event and returns the updated lastUserText.
 func (c *Cascade) handleASR(ev ASREvent, lastUserText string) string {
 	switch ev.Kind {
+
 	case ASRPartial:
-		c.emitTranscript("user", ev.Text) // live caption; not a committed turn
+		c.emitTranscript("user", ev.Text) // live caption
+		c.cancelPending()
+		c.removeSpeculative() // discard previous speculative turn if text changed
+		if c.isPotentialSentence(ev.Text) {
+			// Stable partial that looks complete — start LLM speculatively.
+			c.history = append(c.history, Message{Role: "user", Text: ev.Text})
+			c.speculativeActive = true
+			c.scheduleSpeculative()
+		}
+
 	case ASRSpeechStarted:
+		c.cancelPending()
+		c.removeSpeculative()
 		c.bargeIn()
+
 	case ASRFinal:
 		if jaccard(ev.Text, lastUserText) >= similarityThreshold {
+			c.removeSpeculative()
 			return lastUserText // duplicate utterance — ignore
+		}
+		c.cancelPending()
+		if c.speculativeActive {
+			specText := c.history[len(c.history)-1].Text
+			if jaccard(ev.Text, specText) >= similarityThreshold {
+				// Final confirms speculation — patch text, LLM already running.
+				c.history[len(c.history)-1].Text = ev.Text
+				c.speculativeActive = false
+				return ev.Text
+			}
+			// Final differs — discard speculation, start fresh.
+			c.removeSpeculative()
 		}
 		c.history = append(c.history, Message{Role: "user", Text: ev.Text})
 		c.emitTranscript("user", ev.Text)
-		go c.respond()
+		c.schedulePending(ev.Text)
 		return ev.Text
 	}
 	return lastUserText
 }
 
-// respond streams the LLM reply through TTS into recvCh using a two-phase
-// strategy that cuts time-to-first-audio (TTFA):
+// isPotentialSentence returns true when text ends with sentence-ending
+// punctuation and the same normalised text has been seen stabTrigger times
+// within stabWindow — matching RealtimeVoiceChat's stability check.
+func (c *Cascade) isPotentialSentence(text string) bool {
+	const (
+		stabWindow  = 200 * time.Millisecond
+		stabTrigger = 3
+	)
+	if !strings.ContainsAny(text, sentenceEnders) {
+		c.partialStab = struct {
+			text      string
+			count     int
+			firstSeen time.Time
+		}{}
+		return false
+	}
+	now := time.Now()
+	if text == c.partialStab.text && now.Sub(c.partialStab.firstSeen) <= stabWindow {
+		c.partialStab.count++
+	} else {
+		c.partialStab.text = text
+		c.partialStab.count = 1
+		c.partialStab.firstSeen = now
+	}
+	return c.partialStab.count >= stabTrigger
+}
+
+// removeSpeculative removes the last history entry if a speculative turn is active.
+// Must be called from the run() goroutine.
+func (c *Cascade) removeSpeculative() {
+	if c.speculativeActive && len(c.history) > 0 {
+		c.history = c.history[:len(c.history)-1]
+	}
+	c.speculativeActive = false
+}
+
+// scheduleSpeculative fires respond() immediately (speculation is high-confidence).
+// Must be called from the run() goroutine.
+func (c *Cascade) scheduleSpeculative() {
+	// drain any stale signal before sending
+	select {
+	case <-c.pendingCh:
+	default:
+	}
+	c.pendingCh <- struct{}{}
+}
+
+// schedulePending cancels any in-flight turn-detect wait and starts a new one.
+// After the suggested pause elapses, it signals pendingCh so run() fires respond().
+// Must be called from the run() goroutine.
+func (c *Cascade) schedulePending(text string) {
+	c.cancelPending()
+	ctx, cancel := context.WithCancel(c.ctx)
+	c.pendingCancel = cancel
+	go func() {
+		defer cancel()
+		pause := c.turnDetect.SuggestedPause(ctx, text)
+		select {
+		case <-time.After(pause):
+			select {
+			case c.pendingCh <- struct{}{}:
+			default:
+			}
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// cancelPending cancels any in-flight turn-detect wait and drains any already-
+// queued signal so a subsequent scheduleSpeculative/schedulePending starts clean.
+// Must be called from the run() goroutine.
+func (c *Cascade) cancelPending() {
+	if c.pendingCancel != nil {
+		c.pendingCancel()
+		c.pendingCancel = nil
+	}
+	select {
+	case <-c.pendingCh:
+	default:
+	}
+}
+
+// respond streams the LLM reply through TTS into recvCh as a producer/consumer
+// pipeline that cuts time-to-first-audio (TTFA) and keeps the LLM unblocked:
 //
-//  1. Quick phase: accumulate LLM tokens until the first sentence boundary
-//     (. ? ! newline), then immediately synthesize and play that fragment
-//     while the LLM continues generating.
+//   - segmenter (this goroutine): reads LLM deltas, applies the OnLLMToken
+//     seam, and pushes each completed sentence (split on . ? ! newline / CJK
+//     punctuation) onto the segments channel. The first sentence is the
+//     "quick answer" — it ships the moment the boundary appears, while the
+//     LLM keeps generating the rest.
 //
-//  2. Final phase: once the quick TTS finishes, synthesize all remaining
-//     tokens as a single call (they were buffered while quick was playing).
+//   - TTS worker: drains segments and synthesizes each one in order into the
+//     shared recvCh. Because it runs concurrently, synthesising/playing
+//     sentence N overlaps generating sentence N+1 — the LLM is never blocked
+//     waiting for TTS (only by the segments buffer).
 //
-// Both phases share genCtx so bargeIn() cancels either one immediately.
-// History is updated only after both phases complete or the turn is aborted.
+// With a streaming TTS stage (XTTSStreamTTS) each sentence also streams its
+// own audio incrementally, so playback begins well before the sentence is
+// fully rendered. Both run under genCtx so bargeIn() cancels them at once.
+// History is updated only after the whole turn completes (not on abort).
 func (c *Cascade) respond() {
 	genCtx, cancel := context.WithCancel(c.ctx)
 	done := make(chan struct{})
@@ -88,13 +205,29 @@ func (c *Cascade) respond() {
 		return
 	}
 
-	var (
-		quick strings.Builder // tokens up to (and including) first sentence end
-		final strings.Builder // tokens after the sentence boundary
-		full  strings.Builder // complete reply for history
-		found bool            // true once the quick boundary has been found
-	)
+	segments := make(chan string, 8)
 
+	// TTS worker: synthesize each segment in arrival order. On barge-in /
+	// shutdown synthesize returns false; drain the rest so the segmenter's
+	// sends never block, then exit.
+	ttsDone := make(chan struct{})
+	go func() {
+		defer close(ttsDone)
+		quick := true // first segment is the quick answer
+		for seg := range segments {
+			if !c.synthesize(genCtx, seg, quick) {
+				for range segments {
+				}
+				return
+			}
+			quick = false
+		}
+	}()
+
+	var (
+		full strings.Builder // complete reply for history (original tokens)
+		seg  strings.Builder  // current sentence being accumulated
+	)
 	for delta := range deltas {
 		// LLM intercept seam: let business logic inspect / replace the token.
 		tts := delta
@@ -109,31 +242,18 @@ func (c *Cascade) respond() {
 			continue // token was dropped by the hook (or was a replacement no-op)
 		}
 
-		if found {
-			final.WriteString(tts)
-			continue
-		}
-		quick.WriteString(tts)
+		seg.WriteString(tts)
 		if containsSentenceEnd(tts) {
-			found = true
-			if !c.synthesize(genCtx, quick.String()) {
-				return
-			}
+			segments <- seg.String()
+			seg.Reset()
 		}
 	}
-
-	// If the entire LLM reply had no sentence boundary (e.g. a one-liner with
-	// no punctuation), quick.String() holds everything and final is empty.
-	// Synthesize whichever bucket has the remaining text.
-	remaining := final.String()
-	if !found {
-		remaining = quick.String()
+	// Flush any trailing text with no sentence boundary (e.g. a one-liner).
+	if seg.Len() > 0 {
+		segments <- seg.String()
 	}
-	if remaining != "" {
-		if !c.synthesize(genCtx, remaining) {
-			return
-		}
-	}
+	close(segments)
+	<-ttsDone
 
 	text := full.String()
 	if text == "" {
@@ -145,8 +265,19 @@ func (c *Cascade) respond() {
 
 // synthesize calls TTS and forwards all PCM chunks to recvCh. Returns false if
 // the context was cancelled before synthesis completed (barge-in / shutdown).
-func (c *Cascade) synthesize(ctx context.Context, text string) bool {
-	pcmCh, err := c.tts.Synthesize(ctx, text)
+//
+// When quick is true and the stage implements QuickSynthesizer, the low-latency
+// path is used (the quick answer); otherwise it falls back to Synthesize.
+func (c *Cascade) synthesize(ctx context.Context, text string, quick bool) bool {
+	var (
+		pcmCh <-chan []int16
+		err   error
+	)
+	if qs, ok := c.tts.(QuickSynthesizer); ok && quick {
+		pcmCh, err = qs.SynthesizeQuick(ctx, text)
+	} else {
+		pcmCh, err = c.tts.Synthesize(ctx, text)
+	}
 	if err != nil {
 		return true // TTS error: skip this segment, do not abort the turn
 	}

@@ -36,7 +36,7 @@ func runProxy(cfg runConfig) error {
 		replayIndex = sidechannel.NewReplayClient(cfg.ReplayURL)
 	}
 	breakers := newModelBreakers(cfg.ModelCBEnable, cfg.ModelCB)
-	hub, err := rtc.NewHub(os.Getenv("PUBLIC_IP"))
+	hub, err := rtc.NewHub("")
 	if err != nil {
 		return err
 	}
@@ -51,19 +51,22 @@ func runProxy(cfg runConfig) error {
 	}
 
 	offerHandler := offer.HandlerFields{
-		Limiter:     limiter,
-		Auth:        authn,
+		Limiter:    limiter,
+		Auth:       authn,
 		Publisher:   publisher,
 		ReplayIndex: replayIndex,
 		Guard:       breakers,
-		Hub:         hub,
+		Hub:        hub,
 		Models: offer.ProdModelFactory{
 			Cascade: offer.CascadeConfig{
-				WhisperURL: cfg.CascadeWhisperURL,
-				LLMURL:     cfg.CascadeLLMURL,
-				LLMModel:   cfg.CascadeLLMModel,
-				TTSURL:     cfg.CascadeTTSURL,
-				System:     cfg.CascadeSystem,
+				WhisperURL:    cfg.CascadeWhisperURL,
+				LLMURL:        cfg.CascadeLLMURL,
+				LLMModel:      cfg.CascadeLLMModel,
+				TTSURL:        cfg.CascadeTTSURL,
+				TTSSpeaker:    cfg.CascadeTTSSpeaker,
+				TTSLang:       cfg.CascadeTTSLang,
+				TurnDetectURL: cfg.CascadeTurnDetectURL,
+				System:        cfg.CascadeSystem,
 			},
 		},
 		TrustProxy: cfg.TrustProxy,
@@ -124,6 +127,7 @@ func serveAdmin(addr string, hub *rtc.Hub, publisher sidechannel.Publisher, brea
 			"sessions":            hub.Count(),
 			"opus_complexity":     audio.EncoderComplexity(),
 			"frame_interval":      metrics.FrameIntervalBuckets(),
+			"outbound_media":      metrics.OutboundMediaStats(),
 			"replay":              metrics.ReplayStats(),
 			"model_cb":            modelCB,
 			"sidechannel_dropped": dropped,

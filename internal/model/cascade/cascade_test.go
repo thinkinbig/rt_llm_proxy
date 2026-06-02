@@ -3,6 +3,7 @@ package cascade
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
 )
 
@@ -102,6 +103,84 @@ func TestOnLLMTokenHookFires(t *testing.T) {
 	}
 	if len(got) == 0 {
 		t.Fatal("OnLLMToken hook never called")
+	}
+}
+
+// streamLLM emits each element of deltas as a separate token, so sentence
+// boundaries can land on different segments (unlike fakeLLM's single chunk).
+type streamLLM struct{ deltas []string }
+
+func (f *streamLLM) Generate(_ context.Context, _ []Message) (<-chan string, error) {
+	ch := make(chan string, len(f.deltas))
+	for _, d := range f.deltas {
+		ch <- d
+	}
+	close(ch)
+	return ch, nil
+}
+func (f *streamLLM) Close() error { return nil }
+
+// quickTTS records, in order, whether each segment was synthesized via the
+// quick (low-latency) path or the normal one.
+type quickTTS struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (f *quickTTS) record(kind string) (<-chan []int16, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, kind)
+	f.mu.Unlock()
+	ch := make(chan []int16, 1)
+	ch <- make([]int16, 960)
+	close(ch)
+	return ch, nil
+}
+func (f *quickTTS) Synthesize(context.Context, string) (<-chan []int16, error) {
+	return f.record("final")
+}
+func (f *quickTTS) SynthesizeQuick(context.Context, string) (<-chan []int16, error) {
+	return f.record("quick")
+}
+func (f *quickTTS) Close() error { return nil }
+
+func TestQuickAnswerUsesQuickSynthesizer(t *testing.T) {
+	asr := &fakeASR{events: make(chan ASREvent, 4)}
+	tts := &quickTTS{}
+	c, err := New(context.Background(), Config{
+		ASR: asr,
+		LLM: &streamLLM{deltas: []string{"Hi there. ", "How are you?"}},
+		TTS: tts,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	asr.events <- ASREvent{Kind: ASRFinal, Text: "hello"}
+
+	// The model transcript is emitted only after both segments finish
+	// synthesizing, so waiting for it guarantees calls is complete.
+	for {
+		tr, err := c.RecvTranscript()
+		if err != nil {
+			t.Fatalf("RecvTranscript: %v", err)
+		}
+		if tr.Role == "model" {
+			break
+		}
+	}
+
+	tts.mu.Lock()
+	defer tts.mu.Unlock()
+	want := []string{"quick", "final"}
+	if len(tts.calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", tts.calls, want)
+	}
+	for i := range want {
+		if tts.calls[i] != want[i] {
+			t.Fatalf("calls = %v, want %v", tts.calls, want)
+		}
 	}
 }
 
