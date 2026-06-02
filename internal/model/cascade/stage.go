@@ -1,6 +1,9 @@
 package cascade
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // AudioSource is the output-mix seam. Implement it to inject any audio into
 // the outbound stream — a real music track, a mixed voice+music feed, etc.
@@ -72,4 +75,31 @@ type TTS interface {
 	// synthesis completes. Cancelling ctx aborts (barge-in).
 	Synthesize(ctx context.Context, text string) (<-chan []int16, error)
 	Close() error
+}
+
+// QuickSynthesizer is an optional TTS capability. A stage that implements it
+// can synthesize the quick answer (the first segment of a turn) with settings
+// tuned for minimum time-to-first-audio, trading a little quality/throughput.
+// Stages that don't implement it transparently fall back to Synthesize.
+type QuickSynthesizer interface {
+	SynthesizeQuick(ctx context.Context, text string) (<-chan []int16, error)
+}
+
+// TurnDetector decides how long to wait after an ASR final before committing
+// the turn to the LLM. A complete sentence gets a short pause; a fragment gets
+// a longer one so the user has time to continue.
+//
+// SuggestedPause must return quickly (it is called on the hot path). Use
+// NopTurnDetector when no sidecar is configured.
+type TurnDetector interface {
+	SuggestedPause(ctx context.Context, text string) time.Duration
+}
+
+// NopTurnDetector fires the LLM immediately after ASR final (legacy behaviour).
+// It is the default when Config.TurnDetect is nil. Sidecar-backed detectors
+// live in the turndetect subpackage.
+type NopTurnDetector struct{}
+
+func (NopTurnDetector) SuggestedPause(_ context.Context, _ string) time.Duration {
+	return 0
 }

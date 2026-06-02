@@ -96,12 +96,12 @@ func (f *fakeStore) Resume(id identity.SessionID, userID identity.UserID, provid
 	return f.full, f.missing, f.startSeq, true
 }
 
-type fakeKafka struct {
+type fakeReplayer struct {
 	evs []*sidechannel.TranscriptEvent
 	err error
 }
 
-func (f *fakeKafka) Replay(context.Context, identity.SessionID, identity.UserID, string, uint64, int) ([]*sidechannel.TranscriptEvent, error) {
+func (f *fakeReplayer) Replay(context.Context, identity.SessionID, identity.UserID, string, uint64, int) ([]*sidechannel.TranscriptEvent, error) {
 	return f.evs, f.err
 }
 
@@ -159,14 +159,14 @@ func TestResolveReplayAnonymousMiss(t *testing.T) {
 	}
 }
 
-func TestResolveReplayKafkaHit(t *testing.T) {
-	kafka := &fakeKafka{evs: []*sidechannel.TranscriptEvent{
+func TestResolveReplayIndexHit(t *testing.T) {
+	index := &fakeReplayer{evs: []*sidechannel.TranscriptEvent{
 		{Seq: 2, Role: sidechannel.Role_ROLE_MODEL, Text: "hey"},
 	}}
 	out, err := ResolveReplay(context.Background(), "gemini", "alice",
 		ReplayHeaders{Requested: true, SessionID: "s1", LastSeq: 1},
-		ReplayConfig{Enabled: true}, &fakeStore{}, kafka, nil, "new-id")
-	if err != nil || out.Status != "kafka_hit" || out.StartSeq != 2 || len(out.ReplayLines) != 1 {
+		ReplayConfig{Enabled: true}, &fakeStore{}, index, nil, "new-id")
+	if err != nil || out.Status != "index_hit" || out.StartSeq != 2 || len(out.ReplayLines) != 1 {
 		t.Fatalf("got %+v, %v", out, err)
 	}
 }

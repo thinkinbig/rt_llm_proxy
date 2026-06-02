@@ -58,7 +58,7 @@ flowchart TB
   BRIDGE <-->|"mono s16 PCM @ 48 kHz"| MODELS
   RL <-->|"INCR+EXPIRE (Lua)"| REDIS
   TAP -->|"Publish (non-blocking)"| KAFKA
-  REPLAY -.->|"memory archive · optional Kafka tail"| HUB
+  REPLAY -.->|"memory archive · optional replay-index"| HUB
   REPLAY -.-> KAFKA
   CB -.->|"connect + early stream fault"| MODELS
 ```
@@ -98,7 +98,7 @@ sequenceDiagram
   O->>O: auth → user_id (or "")
   O->>O: modelcb.Allow (503 if open)
   O->>M: Models.New (502 on dial error)
-  O->>R: memory archive → optional Kafka tail
+  O->>R: memory archive → optional replay-index
   Note over R: timeout / miss → status miss,<br/>media still starts
   O->>H: Serve(SDP, model, replay history)
   O-->>B: answer SDP + X-Session-ID + X-Replay-Status
@@ -106,7 +106,7 @@ sequenceDiagram
 ```
 
 Reconnect is **best-effort**: malformed replay headers → `400`; incomplete
-headers → fresh session; Kafka over budget → `kafka_timeout` / `kafka_error` but
+headers → fresh session; replay-index over budget → `index_timeout` / `index_error` but
 the call proceeds.
 
 ### 1.4 Fault tolerance & degradation
@@ -165,6 +165,7 @@ Failover levels (L1–L4) and production scaling notes live in
 | **Model seam** | `internal/model` | The provider-agnostic `Model` interface (`SendAudio`/`SendText`/`Recv`/`Close`). Optional `Transcriber` (`RecvTranscript`) for STT. |
 | **Providers / adapters** | `internal/model/gemini`, `internal/model/doubao` | One concrete `Model` per streaming LLM. Each owns its WebSocket protocol and native audio format. |
 | **Side-channel** | `internal/sidechannel` | `Tap` implements `transcript.Listener`; publishes `TranscriptEvent` to Kafka/stdout using the Bridge-assigned seq. |
+| **Replay index** | `cmd/replay` | Kafka consumer that indexes transcript events and serves `GET /v1/replay` for cross-node reconnect. |
 | **PCM helpers** | `internal/model/pcm` | `ToBytes` / `FromBytes` — s16le serialize for the uplink. Shared only because both adapters serialize contract-side s16; **not** a unified decode layer. |
 | **Audio** | `internal/audio` | Opus encode/decode (libopus via cgo) + linear resampler. |
 | **Rate limit** | `internal/ratelimit` | Redis fixed-window limiter for the SDP offer endpoint. **Control plane only.** |
@@ -285,23 +286,24 @@ good enough for speech. Swap for a polyphase filter if quality ever matters.
 - **Session outlives the request:** model connect + `Serve` use a background
   context, so the media session isn't bound to the SDP HTTP request's lifetime.
 
-### 3.9 Reconnect replay policy (best effort, bounded)  *(`internal/offer`, `internal/sidechannel/kafka.go`)*
+### 3.9 Reconnect replay policy (best effort, bounded)  *(`internal/offer`, `cmd/replay`, `internal/sidechannel`)*
 
 - **Protocol:** reconnect uses `X-Replay-Version: 1`, `X-Session-ID`,
   `X-Last-Seq`; server replies with `X-Replay-Status`.
 - **Resolution:** `offer.ResolveReplay` validates headers and tries memory
-  archive first, then optional Kafka (`-replay-kafka=true`).
+  archive first, then optional replay-index (`-replay-url`).
 - **Strict but non-blocking:** malformed `X-Last-Seq` / unsupported replay
   version returns `400`; missing id/seq simply falls back to a new session.
 - **Provider scoped:** replay only when reconnect provider matches the original
   session/provider to avoid cross-model transcript contamination.
-- **Order of sources:** memory archive first (same node), optional Kafka replay
-  second with hard budget (`-replay-timeout`, default `300ms`) and bounded
-  lines (`-replay-limit`, default `100`).
+- **Order of sources:** memory archive first (same node), replay-index HTTP
+  second; hard budget (`-replay-timeout`, default `300ms`) and bounded lines
+  (`-replay-limit`, default `100`).
 - **Seq invariant:** `transcript.Recorder` assigns seq once; side-channel `Tap`
   and data-channel JSON both reuse that seq (no independent counters).
 - **Invariant preserved:** replay is control-plane best effort; timeout/error
-  never blocks media startup, and can be disabled globally with `-replay-kafka=false`.
+  never blocks media startup, and cross-node replay is disabled when
+  `-replay-url` is empty.
 
 ### 3.10 Provider guard  *(`internal/modelcb`, `internal/offer/intake.go`, `rtc/bridge.go`)*
 

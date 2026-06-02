@@ -1,7 +1,9 @@
-# Cascade pipeline stack: self-hosted Whisper + vLLM/DeepSeek + Coqui TTS + proxy.
+# Cascade pipeline stack: RealtimeSTT (streaming Whisper) + vLLM/Qwen + XTTS streaming TTS + proxy.
 #
 # Usage:
 #   export PUBLIC_IP=<your Volcano Engine VM public IP>
+#   # optional: override host path to Qwen weights (default: WebHarness cache)
+#   export QWEN_MODEL_PATH=/path/to/Qwen3.5-9B
 #   docker compose -f docker-compose.yml -f docker-compose.cascade.yml up --build
 #
 # Security group on Volcano Engine — open these ports:
@@ -11,17 +13,23 @@
 # All three AI services are on the internal Docker network only (not exposed to
 # the public internet). The proxy is the only outward-facing service.
 #
-# First run: model weights are downloaded to named volumes (whisper-cache,
-# vllm-cache, coqui-cache). Subsequent restarts reuse the cache.
+# LLM: mounts local Qwen weights (no HuggingFace download). Whisper/XTTS still
+# use named volumes (whisper-cache, xtts-cache) on first run.
 
 services:
 
-  whisper:
-    image: fedirz/faster-whisper-server:latest-cuda
+  realtimestt:
+    # Streaming ASR: Silero/WebRTC VAD + faster-whisper. Emits speech_start
+    # (barge-in), high-frequency partials (speculative LLM start) and finals
+    # over a WebSocket — what speaches/faster-whisper-server did not provide.
+    build:
+      context: ./realtimestt
+      dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      - WHISPER__MODEL=base
-      - WHISPER__LANGUAGE=zh        # set to "en" or remove for auto-detect
+      - STT_MODEL=base.en          # final-transcription model
+      - STT_REALTIME_MODEL=tiny.en # fast model for live partials
+      - STT_LANGUAGE=en
     volumes:
       - whisper-cache:/root/.cache/huggingface
     deploy:
@@ -34,24 +42,26 @@ services:
     networks:
       - cascade-internal
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 60s   # downloads whisper models on first run
 
   vllm:
     image: vllm/vllm-openai:latest
     restart: unless-stopped
     command: >
-      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-      --quantization bitsandbytes
-      --load-format bitsandbytes
-      --dtype float16
-      --max-model-len 4096
+      --model /models/qwen
+      --served-model-name Qwen3.5-9B
+      --max-model-len 8192
+      --reasoning-parser qwen3
+      --language-model-only
+      --gpu-memory-utilization 0.85
       --host 0.0.0.0
       --port 8000
     volumes:
-      - vllm-cache:/root/.cache/huggingface
+      - ${QWEN_MODEL_PATH:-../WebHarness/.hf-cache/hub/Qwen3.5-9B}:/models/qwen:ro
     deploy:
       resources:
         reservations:
@@ -68,21 +78,14 @@ services:
       retries: 10
       start_period: 120s   # model loading takes a while
 
-  coqui:
-    image: ghcr.io/coqui-ai/tts:latest
+  xtts:
+    # Streaming XTTSv2 server: /tts_stream emits int16 PCM incrementally as it
+    # synthesises (listens on port 80). Replaces the non-streaming Coqui
+    # TTS.server.server which only returned a full WAV per request.
+    image: ghcr.io/coqui-ai/xtts-streaming-server:latest-cuda
     restart: unless-stopped
-    entrypoint:
-      - python3
-      - -m
-      - TTS.server.server
-      - --model_name
-      - tts_models/en/ljspeech/fast_pitch
-      - --port
-      - "5002"
-      - --use_cuda
-      - "true"
     volumes:
-      - coqui-cache:/root/.local/share/tts
+      - xtts-cache:/root/.local/share/tts
     deploy:
       resources:
         reservations:
@@ -93,11 +96,29 @@ services:
     networks:
       - cascade-internal
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:5002/api/tts?text=test"]
+      test: ["CMD", "curl", "-sf", "http://localhost:80/studio_speakers"]
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 60s
+      start_period: 120s   # downloads + loads XTTSv2 on first run
+
+  turndetect:
+    build:
+      context: ./turndetect
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - TURNDETECT_MODEL=KoljaB/SentenceFinishedClassification
+      - TURNDETECT_MIN_PAUSE_MS=300
+    volumes:
+      - turndetect-cache:/root/.cache/huggingface
+    networks:
+      - cascade-internal
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   proxy:
     build: .
@@ -109,25 +130,28 @@ services:
       - PUBLIC_IP=${PUBLIC_IP}
     command: >
       -addr :8080
-      -cascade-whisper ws://whisper:9000/v1/audio/transcriptions/streaming
+      -cascade-whisper ws://realtimestt:8000/v1/audio/transcriptions/streaming
       -cascade-llm http://vllm:8000
-      -cascade-llm-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-      -cascade-tts http://coqui:5002
+      -cascade-llm-model Qwen3.5-9B
+      -cascade-tts http://xtts:80
+      -cascade-turndetect http://turndetect:7000
       -cascade-system "You are a helpful real-time voice assistant."
     depends_on:
-      whisper:
+      realtimestt:
         condition: service_healthy
       vllm:
         condition: service_healthy
-      coqui:
+      xtts:
+        condition: service_healthy
+      turndetect:
         condition: service_healthy
     networks:
       - cascade-internal
 
 volumes:
   whisper-cache:
-  vllm-cache:
-  coqui-cache:
+  xtts-cache:
+  turndetect-cache:
 
 networks:
   cascade-internal:

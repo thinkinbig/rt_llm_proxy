@@ -53,7 +53,7 @@ Flags:
 | `-sidechannel` | `off` | transcript side-channel: `off` \| `stdout` \| `kafka` |
 | `-kafka` | `` | kafka seed brokers (csv) for `-sidechannel=kafka` |
 | `-kafka-topic` | `transcripts` | kafka topic for transcript events |
-| `-replay-kafka` | `false` | enable best-effort cross-node reconnect replay from Kafka |
+| `-replay-url` | `` | replay-index service base URL (enables cross-node reconnect replay when set) |
 | `-replay-timeout` | `300ms` | hard replay timeout budget (keep reconnect latency bounded) |
 | `-replay-limit` | `100` | max replayed transcript lines per reconnect |
 | `-model-cb` | `true` | circuit-break model connect attempts (`gemini` / `doubao`) |
@@ -192,6 +192,7 @@ internal/model/pcm/      shared s16le serialize (uplink bytes)
 internal/audio/     Opus encode/decode (libopus) + linear resampler
 internal/auth/      Authenticator seam (bearer -> user id, fail-open anonymous)
 internal/sidechannel/    transcript tap -> Kafka (protobuf, off the media path)
+cmd/replay/              replay-index: Kafka consumer + reconnect query API
 internal/metrics/   lock-free frame-interval histogram (the pacing SLO)
 internal/ratelimit/ Redis fixed-window limiter (atomic, fail-open)
 demo/               minimal browser client
@@ -255,15 +256,14 @@ so `hostNetwork`/`replicas: N` don't make media work; that needs a TURN relay.
 |---|---|---|
 | L1 | server dies → client reconnects, service stays up | reachable once replicated behind TURN |
 | L2 | reconnect restores the *session* | **basic implementation** — demo client sends `X-Session-ID` + `X-Last-Seq`; proxy resumes same-node session and reuses the session id |
-| L3 | reconnect resumes *progress* | **partial** — same-node replay is in-memory; optional cross-node replay is best-effort via Kafka tail scan (`session_id` + `last_seq`) |
+| L3 | reconnect resumes *progress* | **partial** — same-node replay is in-memory; cross-node replay uses the replay-index service (`-replay-url`) |
 | L4 | near-seamless connection migration | impractical (fd/media affinity) — don't chase it |
 
 So it's **not "can't be done"** — the design already leans the right way: the
 proxy is thin (state behind the `Model` seam), key events are externalized to a
 replayable Kafka log keyed by `user_id` with a monotonic `seq`, and `session_id`
-is server-minted. With `-replay-kafka=true`, we do a **best-effort cross-node
-replay** from Kafka using `session_id`+`last_seq`; for stronger L3 this should
-evolve from a bounded tail scan to a dedicated replay index/consumer service.
+is server-minted. With `-replay-url` set, the proxy queries the replay-index
+service for events after `last_seq`.
 The hard caveat:
 the *provider's* dialogue context (Gemini/Doubao) lives in their server-side
 socket, so we can restore our session metadata and transcribed text, but cannot
@@ -273,7 +273,7 @@ Reconnect protocol notes:
 
 - Replay protocol version is `X-Replay-Version: 1`.
 - Server returns `X-Replay-Status` as one of:
-  `memory_hit`, `kafka_hit`, `kafka_timeout`, `kafka_error`, `miss`,
+  `memory_hit`, `index_hit`, `index_timeout`, `index_error`, `miss`,
   `disabled`, `protocol_invalid`.
 - Replay requires both `X-Session-ID` and `X-Last-Seq`; malformed
   `X-Last-Seq` or unsupported replay version returns `400`.

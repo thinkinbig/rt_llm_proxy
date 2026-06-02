@@ -104,12 +104,12 @@ func (h *Handler) clientIP(r *http.Request) string {
 type HandlerFields struct {
 	Limiter    *ratelimit.Limiter
 	Auth       *auth.Authenticator
-	Publisher  sidechannel.Publisher
-	Kafka      KafkaReplayer
-	Guard      *modelcb.Manager
-	Hub        MediaHub
-	Models     ModelFactory
-	Replay     ReplayConfig
+	Publisher   sidechannel.Publisher
+	ReplayIndex Replayer
+	Guard       *modelcb.Manager
+	Hub         MediaHub
+	Models      ModelFactory
+	Replay      ReplayConfig
 	TrustProxy bool
 }
 
@@ -118,9 +118,9 @@ func (f HandlerFields) Build() *Handler {
 	return NewHandler(Intake{
 		Limiter:   f.Limiter,
 		Auth:      f.Auth,
-		Publisher: f.Publisher,
-		Kafka:     f.Kafka,
-		Guard:     f.Guard,
+		Publisher:   f.Publisher,
+		ReplayIndex: f.ReplayIndex,
+		Guard:       f.Guard,
 		Hub:       f.Hub,
 		Models:    f.Models,
 		Replay:    f.Replay,

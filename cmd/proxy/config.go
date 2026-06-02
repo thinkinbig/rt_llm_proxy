@@ -20,7 +20,7 @@ type runConfig struct {
 	KafkaBrokers    string
 	KafkaTopic      string
 
-	ReplayKafka   bool
+	ReplayURL     string
 	ReplayTimeout time.Duration
 	ReplayLimit   int
 
@@ -31,11 +31,14 @@ type runConfig struct {
 	AdaptiveMode   string
 
 	// Cascade stage endpoints (used when ?model=cascade).
-	CascadeWhisperURL string
-	CascadeLLMURL     string
-	CascadeLLMModel   string
-	CascadeTTSURL     string
-	CascadeSystem     string
+	CascadeWhisperURL    string
+	CascadeLLMURL        string
+	CascadeLLMModel      string
+	CascadeTTSURL        string
+	CascadeTTSSpeaker    string
+	CascadeTTSLang       string
+	CascadeTurnDetectURL string
+	CascadeSystem        string
 }
 
 func parseFlags() runConfig {
@@ -47,8 +50,8 @@ func parseFlags() runConfig {
 	scMode := flag.String("sidechannel", "off", "transcript side-channel: off|stdout|kafka")
 	kafkaBrokers := flag.String("kafka", "", "kafka seed brokers (csv) for -sidechannel=kafka")
 	kafkaTopic := flag.String("kafka-topic", "transcripts", "kafka topic for transcript events")
-	replayKafka := flag.Bool("replay-kafka", false, "enable best-effort cross-node replay from Kafka on reconnect")
-	replayTimeout := flag.Duration("replay-timeout", 300*time.Millisecond, "replay timeout budget when -replay-kafka=true")
+	replayURL := flag.String("replay-url", "", "replay-index service base URL (enables cross-node reconnect replay when set)")
+	replayTimeout := flag.Duration("replay-timeout", 300*time.Millisecond, "replay timeout budget when -replay-url is set")
 	replayLimit := flag.Int("replay-limit", 100, "max replay transcript lines on reconnect")
 	modelCBEnable := flag.Bool("model-cb", true, "enable model connect circuit breaker")
 	modelCBOpenAfter := flag.Int("model-cb-open-after", 5, "consecutive failures before opening model circuit")
@@ -68,8 +71,11 @@ func parseFlags() runConfig {
 	adaptiveMode := flag.String("adaptive", "off", "adaptive Opus complexity under load: off|sessions|drift")
 	cascadeWhisperURL := flag.String("cascade-whisper", "ws://localhost:9000/v1/audio/transcriptions/streaming", "faster-whisper-server WebSocket URL for cascade ASR")
 	cascadeLLMURL := flag.String("cascade-llm", "http://localhost:8000", "vLLM base URL for cascade LLM")
-	cascadeLLMModel := flag.String("cascade-llm-model", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "model name served by vLLM")
-	cascadeTTSURL := flag.String("cascade-tts", "http://localhost:5002", "Coqui TTS server base URL for cascade TTS")
+	cascadeLLMModel := flag.String("cascade-llm-model", "Qwen3.5-9B", "model name served by vLLM")
+	cascadeTTSURL := flag.String("cascade-tts", "http://localhost:8020", "xtts-streaming-server base URL for cascade TTS")
+	cascadeTTSSpeaker := flag.String("cascade-tts-speaker", "", "XTTS studio speaker name (empty = first available)")
+	cascadeTTSLang := flag.String("cascade-tts-lang", "en", "XTTS language code (e.g. en, zh-cn)")
+	cascadeTurnDetectURL := flag.String("cascade-turndetect", "", "turn-detect sidecar URL (empty = fire LLM immediately after ASR final)")
 	cascadeSystem := flag.String("cascade-system", "You are a helpful voice assistant.", "system prompt for cascade LLM")
 	flag.Parse()
 
@@ -83,7 +89,7 @@ func parseFlags() runConfig {
 		SidechannelMode: *scMode,
 		KafkaBrokers:    *kafkaBrokers,
 		KafkaTopic:      *kafkaTopic,
-		ReplayKafka:     *replayKafka,
+		ReplayURL:       *replayURL,
 		ReplayTimeout:   *replayTimeout,
 		ReplayLimit:     *replayLimit,
 		ModelCBEnable:   *modelCBEnable,
@@ -107,10 +113,13 @@ func parseFlags() runConfig {
 		},
 		OpusComplexity:    *opusComplexity,
 		AdaptiveMode:      *adaptiveMode,
-		CascadeWhisperURL: *cascadeWhisperURL,
-		CascadeLLMURL:     *cascadeLLMURL,
-		CascadeLLMModel:   *cascadeLLMModel,
-		CascadeTTSURL:     *cascadeTTSURL,
-		CascadeSystem:     *cascadeSystem,
+		CascadeWhisperURL:    *cascadeWhisperURL,
+		CascadeLLMURL:        *cascadeLLMURL,
+		CascadeLLMModel:      *cascadeLLMModel,
+		CascadeTTSURL:        *cascadeTTSURL,
+		CascadeTTSSpeaker:    *cascadeTTSSpeaker,
+		CascadeTTSLang:       *cascadeTTSLang,
+		CascadeTurnDetectURL: *cascadeTurnDetectURL,
+		CascadeSystem:        *cascadeSystem,
 	}
 }
