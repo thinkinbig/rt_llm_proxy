@@ -29,6 +29,13 @@ type runConfig struct {
 
 	OpusComplexity int
 	AdaptiveMode   string
+
+	// Cascade stage endpoints (used when ?model=cascade).
+	CascadeWhisperURL string
+	CascadeLLMURL     string
+	CascadeLLMModel   string
+	CascadeTTSURL     string
+	CascadeSystem     string
 }
 
 func parseFlags() runConfig {
@@ -59,6 +66,11 @@ func parseFlags() runConfig {
 	adminAddr := flag.String("admin", "", "admin listen address for /stats + /debug/pprof (empty = off)")
 	opusComplexity := flag.Int("opus-complexity", -1, "Opus encoder complexity 0-10 (-1 = libopus default; lower = less CPU)")
 	adaptiveMode := flag.String("adaptive", "off", "adaptive Opus complexity under load: off|sessions|drift")
+	cascadeWhisperURL := flag.String("cascade-whisper", "ws://localhost:9000/v1/audio/transcriptions/streaming", "faster-whisper-server WebSocket URL for cascade ASR")
+	cascadeLLMURL := flag.String("cascade-llm", "http://localhost:8000", "vLLM base URL for cascade LLM")
+	cascadeLLMModel := flag.String("cascade-llm-model", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "model name served by vLLM")
+	cascadeTTSURL := flag.String("cascade-tts", "http://localhost:5002", "Coqui TTS server base URL for cascade TTS")
+	cascadeSystem := flag.String("cascade-system", "You are a helpful voice assistant.", "system prompt for cascade LLM")
 	flag.Parse()
 
 	return runConfig{
@@ -93,7 +105,12 @@ func parseFlags() runConfig {
 				AuthOpenFor:     *modelCBAuthOpenForDoubao,
 			},
 		},
-		OpusComplexity: *opusComplexity,
-		AdaptiveMode:   *adaptiveMode,
+		OpusComplexity:    *opusComplexity,
+		AdaptiveMode:      *adaptiveMode,
+		CascadeWhisperURL: *cascadeWhisperURL,
+		CascadeLLMURL:     *cascadeLLMURL,
+		CascadeLLMModel:   *cascadeLLMModel,
+		CascadeTTSURL:     *cascadeTTSURL,
+		CascadeSystem:     *cascadeSystem,
 	}
 }

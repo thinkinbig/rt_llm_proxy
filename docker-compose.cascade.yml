@@ -1,0 +1,134 @@
+# Cascade pipeline stack: self-hosted Whisper + vLLM/DeepSeek + Coqui TTS + proxy.
+#
+# Usage:
+#   export PUBLIC_IP=<your Volcano Engine VM public IP>
+#   docker compose -f docker-compose.yml -f docker-compose.cascade.yml up --build
+#
+# Security group on Volcano Engine — open these ports:
+#   TCP  8080        (SDP offer + HTTP)
+#   UDP  10000-60000 (WebRTC media)
+#
+# All three AI services are on the internal Docker network only (not exposed to
+# the public internet). The proxy is the only outward-facing service.
+#
+# First run: model weights are downloaded to named volumes (whisper-cache,
+# vllm-cache, coqui-cache). Subsequent restarts reuse the cache.
+
+services:
+
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cuda
+    restart: unless-stopped
+    environment:
+      - WHISPER__MODEL=base
+      - WHISPER__LANGUAGE=zh        # set to "en" or remove for auto-detect
+    volumes:
+      - whisper-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - cascade-internal
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    command: >
+      --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+      --quantization bitsandbytes
+      --load-format bitsandbytes
+      --dtype float16
+      --max-model-len 4096
+      --host 0.0.0.0
+      --port 8000
+    volumes:
+      - vllm-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - cascade-internal
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s   # model loading takes a while
+
+  coqui:
+    image: ghcr.io/coqui-ai/tts:latest
+    restart: unless-stopped
+    entrypoint:
+      - python3
+      - -m
+      - TTS.server.server
+      - --model_name
+      - tts_models/en/ljspeech/fast_pitch
+      - --port
+      - "5002"
+      - --use_cuda
+      - "true"
+    volumes:
+      - coqui-cache:/root/.local/share/tts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - cascade-internal
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5002/api/tts?text=test"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  proxy:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "10000-60000:10000-60000/udp"
+    environment:
+      - PUBLIC_IP=${PUBLIC_IP}
+    command: >
+      -addr :8080
+      -cascade-whisper ws://whisper:9000/v1/audio/transcriptions/streaming
+      -cascade-llm http://vllm:8000
+      -cascade-llm-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+      -cascade-tts http://coqui:5002
+      -cascade-system "You are a helpful real-time voice assistant."
+    depends_on:
+      whisper:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+      coqui:
+        condition: service_healthy
+    networks:
+      - cascade-internal
+
+volumes:
+  whisper-cache:
+  vllm-cache:
+  coqui-cache:
+
+networks:
+  cascade-internal:
+    driver: bridge

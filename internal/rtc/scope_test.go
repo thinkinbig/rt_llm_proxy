@@ -11,7 +11,7 @@ import (
 )
 
 func TestSessionScopeAbortUncommitted(t *testing.T) {
-	h, err := NewHub()
+	h, err := NewHub("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestSessionScopeAbortUncommitted(t *testing.T) {
 }
 
 func TestSessionScopeCommitThenClose(t *testing.T) {
-	h, err := NewHub()
+	h, err := NewHub("")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,18 @@ package cascade
 
 import "context"
 
+// AudioSource is the output-mix seam. Implement it to inject any audio into
+// the outbound stream — a real music track, a mixed voice+music feed, etc.
+//
+// Read returns the next PCM chunk (mono s16, 48kHz). It must return io.EOF
+// when the source is exhausted so Cascade can fall back to TTS audio.
+// Cascade calls Close when the source is replaced or the session ends.
+type AudioSource interface {
+	Read() ([]int16, error)
+	Close() error
+}
+
+
 // Stage audio contract mirrors model.Model: mono signed-16 PCM at 48kHz. Each
 // stage implementation resamples to/from its provider wire rate internally,
 // exactly like the gemini/doubao adapters do.

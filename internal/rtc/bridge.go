@@ -69,7 +69,12 @@ type session struct {
 
 // NewHub builds the pion API with a custom MediaEngine (Opus + our fmtp) and
 // the default interceptors.
-func NewHub() (*Hub, error) {
+//
+// publicIP, if non-empty, is added as a NAT1To1 mapping so pion advertises it
+// in ICE candidates instead of the private interface address. Required when the
+// proxy runs behind a cloud VM's 1:1 NAT (e.g. Volcano Engine / AWS / GCP) and
+// browsers connect from the public internet.
+func NewHub(publicIP string) (*Hub, error) {
 	me := &webrtc.MediaEngine{}
 	if err := me.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -86,7 +91,18 @@ func NewHub() (*Hub, error) {
 	if err := webrtc.RegisterDefaultInterceptors(me, ir); err != nil {
 		return nil, err
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithInterceptorRegistry(ir))
+	se := &webrtc.SettingEngine{}
+	if publicIP != "" {
+		se.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{ //nolint:errcheck
+			External:        []string{publicIP},
+			AsCandidateType: webrtc.ICECandidateTypeHost,
+		})
+	}
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(me),
+		webrtc.WithInterceptorRegistry(ir),
+		webrtc.WithSettingEngine(*se),
+	)
 	return &Hub{
 		api:      api,
 		conns:    make(map[identity.SessionID]*session),

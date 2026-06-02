@@ -24,15 +24,28 @@ type Config struct {
 	LLM    LLM
 	TTS    TTS
 	System string // optional system prompt, seeded as history[0]
+
+	// OnLLMToken is called for each token emitted by the LLM before it is
+	// forwarded to TTS. It receives the current token and the accumulated
+	// reply so far.
+	//
+	// Return (replacement, true) to substitute the token (e.g. inject a
+	// tool-call sentinel, modify wording). Return ("", false) to pass the
+	// original token through unchanged. Returning ("", true) silently drops
+	// the token from TTS without affecting history accumulation.
+	//
+	// nil means no interception (default, zero overhead).
+	OnLLMToken func(token, accumulated string) (string, bool)
 }
 
 type Cascade struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	asr ASR
-	llm LLM
-	tts TTS
+	asr        ASR
+	llm        LLM
+	tts        TTS
+	onLLMToken func(token, accumulated string) (string, bool)
 
 	recvCh       chan []int16          // TTS audio out -> Recv()
 	transcriptCh chan model.Transcript // user + model text -> RecvTranscript()
@@ -41,8 +54,15 @@ type Cascade struct {
 	history []Message // touched only by the run() goroutine; no lock needed
 
 	// barge-in handle: cancels the in-flight LLM+TTS for the current turn.
+	// genDone is closed by respond() on exit so bargeIn() can wait for it.
 	genMu     sync.Mutex
 	genCancel context.CancelFunc
+	genDone   chan struct{}
+
+	// output-mix seam: when non-nil, Recv() reads from audioSrc instead of
+	// recvCh. Falls back to recvCh on io.EOF.
+	audioMu  sync.Mutex
+	audioSrc AudioSource
 
 	wg sync.WaitGroup
 }
@@ -60,6 +80,7 @@ func New(ctx context.Context, cfg Config) (*Cascade, error) {
 	c := &Cascade{
 		ctx: cctx, cancel: cancel,
 		asr: cfg.ASR, llm: cfg.LLM, tts: cfg.TTS,
+		onLLMToken:   cfg.OnLLMToken,
 		recvCh:       make(chan []int16, 64),
 		transcriptCh: make(chan model.Transcript, 64),
 		textIn:       make(chan string, 8),
@@ -86,10 +107,31 @@ func (c *Cascade) SendText(text string) error {
 	}
 }
 
-// Recv: next chunk of TTS audio (48k mono), or io.EOF on close. Blocks during
-// silence, exactly like the STS adapters — the pump simply waits, emitting no
-// frame, and Opus DTX covers the gap.
+// Recv: next chunk of audio (48k mono), or io.EOF on close.
+//
+// When an AudioSource is active (set via SetAudioSource), reads from it first.
+// On io.EOF from the source the source is cleared and Recv falls back to the
+// TTS recvCh, so the bot's voice resumes seamlessly after a track ends.
+// Blocks during silence exactly like the STS adapters.
 func (c *Cascade) Recv() ([]int16, error) {
+	c.audioMu.Lock()
+	src := c.audioSrc
+	c.audioMu.Unlock()
+
+	if src != nil {
+		pcm, err := src.Read()
+		if err == nil {
+			return pcm, nil
+		}
+		// Source exhausted (io.EOF) or errored — clear it and fall through.
+		c.audioMu.Lock()
+		if c.audioSrc == src { // guard against concurrent SetAudioSource
+			src.Close()
+			c.audioSrc = nil
+		}
+		c.audioMu.Unlock()
+	}
+
 	select {
 	case <-c.ctx.Done():
 		return nil, io.EOF
@@ -98,6 +140,21 @@ func (c *Cascade) Recv() ([]int16, error) {
 			return nil, io.EOF
 		}
 		return pcm, nil
+	}
+}
+
+// SetAudioSource injects an AudioSource into the outbound stream. Subsequent
+// Recv() calls read from src until it returns io.EOF, then fall back to TTS
+// audio. Any previously active source is closed immediately.
+//
+// Pass nil to clear an active source without a replacement.
+func (c *Cascade) SetAudioSource(src AudioSource) {
+	c.audioMu.Lock()
+	old := c.audioSrc
+	c.audioSrc = src
+	c.audioMu.Unlock()
+	if old != nil {
+		old.Close()
 	}
 }
 
@@ -138,8 +195,9 @@ func (c *Cascade) HandleInterrupted() error {
 	return nil
 }
 
-func (c *Cascade) setGenCancel(cancel context.CancelFunc) {
+func (c *Cascade) setGenCancel(cancel context.CancelFunc, done chan struct{}) {
 	c.genMu.Lock()
 	c.genCancel = cancel
+	c.genDone = done
 	c.genMu.Unlock()
 }

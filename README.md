@@ -18,6 +18,7 @@ lives purely on the control plane (the SDP offer endpoint).
 |---|---|---|
 | `gemini` (default) | Gemini Live (`BidiGenerateContent`) | working |
 | `doubao` | Doubao 端到端实时语音 (Volcengine binary V3 WS) | working |
+| `cascade` | Self-hosted ASR → LLM → TTS pipeline (see below) | working |
 | `loopback` | fake provider (sine tone, no upstream) — load testing only | working |
 
 ## Prerequisites
@@ -76,6 +77,105 @@ Env:
 - **Doubao** — `DOUBAO_APP_ID`, `DOUBAO_ACCESS_TOKEN` (开通豆包端到端实时语音大模型后获取),
   optional `DOUBAO_BOT_NAME`.
 
+## Cascade pipeline (`?model=cascade`)
+
+A self-hosted, three-stage ASR → LLM → TTS pipeline that runs alongside the
+STS providers and is selected per-session via `?model=cascade`.
+
+```
+browser ──WebRTC(Opus)──▶ proxy ──PCM──▶ Whisper-Base (ASR)
+                                              │ transcript
+                                              ▼
+                                    vLLM / DeepSeek-R1-7B  ← LLM intercept seam
+                                              │ token stream
+                                              ▼
+                                      Coqui TTS FastPitch
+                                              │ PCM
+        ◀──Opus────────── proxy ◀─────────────┘
+                            ▲
+                     output-mix seam (inject real tracks here)
+```
+
+All three services are **co-located on a single GPU host** (Volcano Engine L20,
+24 GB VRAM). The proxy ↔ model hop is LAN-local (~1–5 ms), making the two
+intercept seams cheap enough for real-time use.
+
+### Two business seams
+
+The cascade exposes two seams that keep the core proxy business-agnostic while
+enabling downstream use cases (e.g. a personalized real-time DJ):
+
+**1. LLM intercept seam — `Config.OnLLMToken`**
+
+Called per token before it reaches TTS. Return `("", false)` to pass through,
+`(replacement, true)` to substitute, `("", true)` to drop silently.
+
+```go
+cascade.New(ctx, cascade.Config{
+    OnLLMToken: func(token, accumulated string) (string, bool) {
+        if id := detectSongIntent(accumulated + token); id != "" {
+            go playTrack(id)       // trigger output-mix seam
+            return "", true        // drop sentinel from TTS
+        }
+        return "", false
+    },
+})
+```
+
+**2. Output-mix seam — `Cascade.SetAudioSource`**
+
+Injects any `AudioSource` into the outbound stream. `Recv()` reads from it
+until `io.EOF`, then falls back to TTS audio automatically.
+
+```go
+type AudioSource interface {
+    Read() ([]int16, error) // mono s16, 48kHz; return io.EOF when done
+    Close() error
+}
+
+// Switch to a real track mid-session:
+c.SetAudioSource(NewMP3Source("track-42.mp3"))
+```
+
+### Low-latency design: quick/final two-phase TTS
+
+Rather than waiting for the full LLM reply before starting TTS, the cascade
+synthesizes the **first sentence** (`quick`) as soon as the LLM produces it,
+then synthesizes the **remainder** (`final`) while the quick audio is playing.
+This cuts time-to-first-audio (TTFA) to roughly one sentence worth of LLM
+latency instead of a full reply.
+
+### Barge-in
+
+When the ASR detects the user starting to speak (`ASRSpeechStarted`), the
+in-flight LLM HTTP stream and TTS synthesis are cancelled immediately via
+context cancellation. The cancel sequence waits for `respond()` to exit before
+starting the new turn, preventing any race between old and new audio.
+
+Duplicate utterances (Jaccard token similarity ≥ 0.9) are ignored — the
+bot will not restart a reply it is already giving for essentially the same input.
+
+### Self-hosted services required
+
+| Service | Recommended | Env / flag |
+|---|---|---|
+| ASR | [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) (Whisper Base) | `-whisper-url ws://localhost:9000/...` |
+| LLM | [vLLM](https://github.com/vllm-project/vllm) serving DeepSeek-R1-7B INT8 | `-llm-url http://localhost:8000` |
+| TTS | [Coqui TTS](https://github.com/coqui-ai/TTS) server (FastPitch) | `-tts-url http://localhost:5002` |
+
+> All three fit on a single L20 (24 GB): Whisper-Base ~1.5 GB + DeepSeek-R1-7B
+> INT8 ~7 GB + Coqui TTS ~2 GB + overhead ≈ 13 GB total.
+
+### Fault tolerance
+
+- LLM and TTS HTTP calls retry **once** on transient failure, then fast-fail.
+- Session reconnect is handled by the existing Kafka `session_id`+`seq` path
+  (same as all other providers).
+- **Single-point failure**: a GPU host crash ends all active cascade sessions.
+  This is accepted for the current single-host deployment. For multi-host
+  resilience, the three stages would need to be promoted to independent services
+  with their own reconnect logic — out of scope here.
+
 ## Layout
 
 ```
@@ -85,6 +185,8 @@ internal/rtc/       pion WebRTC bridge + session registry; SDP, Opus<->PCM, audi
 internal/model/     Model seam (interface only)
 internal/model/gemini/   Gemini Live adapter
 internal/model/doubao/    Doubao realtime dialogue adapter
+internal/model/cascade/   ASR→LLM→TTS cascade pipeline (two seams, barge-in)
+internal/model/cascade/fakestage/  network-free stubs for tests
 internal/model/loopback/  fake provider (sine tone) for load testing
 internal/model/pcm/      shared s16le serialize (uplink bytes)
 internal/audio/     Opus encode/decode (libopus) + linear resampler

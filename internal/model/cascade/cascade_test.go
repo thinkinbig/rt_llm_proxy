@@ -2,6 +2,7 @@ package cascade
 
 import (
 	"context"
+	"io"
 	"testing"
 )
 
@@ -75,6 +76,67 @@ func TestFullTurnProducesAudioAndTranscripts(t *testing.T) {
 	}
 	if got["user"] != "hello" || got["model"] != "hi there" {
 		t.Fatalf("transcripts = %+v", got)
+	}
+}
+
+func TestOnLLMTokenHookFires(t *testing.T) {
+	asr := &fakeASR{events: make(chan ASREvent, 4)}
+	var got []string
+	c, err := New(context.Background(), Config{
+		ASR: asr,
+		LLM: &fakeLLM{reply: "hello world"},
+		TTS: &fakeTTS{frame: make([]int16, 960)},
+		OnLLMToken: func(token, _ string) (string, bool) {
+			got = append(got, token)
+			return "", false // pass through
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	asr.events <- ASREvent{Kind: ASRFinal, Text: "hi"}
+	if _, err := c.Recv(); err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("OnLLMToken hook never called")
+	}
+}
+
+// fakeAudioSource streams a fixed buffer then returns io.EOF.
+type fakeAudioSource struct {
+	frames [][]int16
+	pos    int
+}
+
+func (f *fakeAudioSource) Read() ([]int16, error) {
+	if f.pos >= len(f.frames) {
+		return nil, io.EOF
+	}
+	pcm := f.frames[f.pos]
+	f.pos++
+	return pcm, nil
+}
+func (f *fakeAudioSource) Close() error { return nil }
+
+func TestSetAudioSourceTakesPriority(t *testing.T) {
+	c, _ := newTestCascade(t)
+	defer c.Close()
+
+	sentinel := make([]int16, 480) // distinct from fakeTTS frame (960 samples)
+	for i := range sentinel {
+		sentinel[i] = 1
+	}
+	c.SetAudioSource(&fakeAudioSource{frames: [][]int16{sentinel}})
+
+	pcm, err := c.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if len(pcm) != 480 || pcm[0] != 1 {
+		t.Fatalf("expected audio source frame, got len=%d val=%d", len(pcm), pcm[0])
 	}
 }
 

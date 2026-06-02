@@ -36,7 +36,7 @@ func runProxy(cfg runConfig) error {
 		replaySource = k
 	}
 	breakers := newModelBreakers(cfg.ModelCBEnable, cfg.ModelCB)
-	hub, err := rtc.NewHub()
+	hub, err := rtc.NewHub(os.Getenv("PUBLIC_IP"))
 	if err != nil {
 		return err
 	}
@@ -57,7 +57,15 @@ func runProxy(cfg runConfig) error {
 		Kafka:      replaySource,
 		Guard:      breakers,
 		Hub:        hub,
-		Models:     offer.ProdModelFactory{},
+		Models: offer.ProdModelFactory{
+				Cascade: offer.CascadeConfig{
+					WhisperURL: cfg.CascadeWhisperURL,
+					LLMURL:     cfg.CascadeLLMURL,
+					LLMModel:   cfg.CascadeLLMModel,
+					TTSURL:     cfg.CascadeTTSURL,
+					System:     cfg.CascadeSystem,
+				},
+			},
 		TrustProxy: cfg.TrustProxy,
 		Replay: offer.ReplayConfig{
 			Enabled: cfg.ReplayKafka,
