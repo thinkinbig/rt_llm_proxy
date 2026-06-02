@@ -35,6 +35,20 @@ services:
       timeout: 5s
       retries: 10
 
+  replay:
+    build:
+      context: .
+      dockerfile: Dockerfile.replay
+    restart: unless-stopped
+    command:
+      - -addr
+      - :8090
+      - -kafka
+      - kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   proxy:
     command:
       - -addr
@@ -43,6 +57,10 @@ services:
       - kafka
       - -kafka
       - kafka:9092
+      - -replay-url
+      - http://replay:8090
     depends_on:
       kafka:
         condition: service_healthy
+      replay:
+        condition: service_started

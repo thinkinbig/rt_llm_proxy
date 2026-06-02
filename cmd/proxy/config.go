@@ -20,7 +20,7 @@ type runConfig struct {
 	KafkaBrokers    string
 	KafkaTopic      string
 
-	ReplayKafka   bool
+	ReplayURL     string
 	ReplayTimeout time.Duration
 	ReplayLimit   int
 
@@ -47,8 +47,8 @@ func parseFlags() runConfig {
 	scMode := flag.String("sidechannel", "off", "transcript side-channel: off|stdout|kafka")
 	kafkaBrokers := flag.String("kafka", "", "kafka seed brokers (csv) for -sidechannel=kafka")
 	kafkaTopic := flag.String("kafka-topic", "transcripts", "kafka topic for transcript events")
-	replayKafka := flag.Bool("replay-kafka", false, "enable best-effort cross-node replay from Kafka on reconnect")
-	replayTimeout := flag.Duration("replay-timeout", 300*time.Millisecond, "replay timeout budget when -replay-kafka=true")
+	replayURL := flag.String("replay-url", "", "replay-index service base URL (enables cross-node reconnect replay when set)")
+	replayTimeout := flag.Duration("replay-timeout", 300*time.Millisecond, "replay timeout budget when -replay-url is set")
 	replayLimit := flag.Int("replay-limit", 100, "max replay transcript lines on reconnect")
 	modelCBEnable := flag.Bool("model-cb", true, "enable model connect circuit breaker")
 	modelCBOpenAfter := flag.Int("model-cb-open-after", 5, "consecutive failures before opening model circuit")
@@ -83,7 +83,7 @@ func parseFlags() runConfig {
 		SidechannelMode: *scMode,
 		KafkaBrokers:    *kafkaBrokers,
 		KafkaTopic:      *kafkaTopic,
-		ReplayKafka:     *replayKafka,
+		ReplayURL:       *replayURL,
 		ReplayTimeout:   *replayTimeout,
 		ReplayLimit:     *replayLimit,
 		ModelCBEnable:   *modelCBEnable,

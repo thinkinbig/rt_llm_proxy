@@ -31,9 +31,9 @@ func runProxy(cfg runConfig) error {
 	limiter := ratelimit.New(cfg.RedisAddr, cfg.RLMax, cfg.RLWindow)
 	authn := auth.New(auth.DevVerifier{})
 	publisher := newPublisher(cfg.SidechannelMode, cfg.KafkaBrokers, cfg.KafkaTopic)
-	var replaySource offer.KafkaReplayer
-	if k, ok := publisher.(*sidechannel.Kafka); ok {
-		replaySource = k
+	var replayIndex offer.Replayer
+	if cfg.ReplayURL != "" {
+		replayIndex = sidechannel.NewReplayClient(cfg.ReplayURL)
 	}
 	breakers := newModelBreakers(cfg.ModelCBEnable, cfg.ModelCB)
 	hub, err := rtc.NewHub(os.Getenv("PUBLIC_IP"))
@@ -51,24 +51,24 @@ func runProxy(cfg runConfig) error {
 	}
 
 	offerHandler := offer.HandlerFields{
-		Limiter:    limiter,
-		Auth:       authn,
-		Publisher:  publisher,
-		Kafka:      replaySource,
-		Guard:      breakers,
-		Hub:        hub,
+		Limiter:     limiter,
+		Auth:        authn,
+		Publisher:   publisher,
+		ReplayIndex: replayIndex,
+		Guard:       breakers,
+		Hub:         hub,
 		Models: offer.ProdModelFactory{
-				Cascade: offer.CascadeConfig{
-					WhisperURL: cfg.CascadeWhisperURL,
-					LLMURL:     cfg.CascadeLLMURL,
-					LLMModel:   cfg.CascadeLLMModel,
-					TTSURL:     cfg.CascadeTTSURL,
-					System:     cfg.CascadeSystem,
-				},
+			Cascade: offer.CascadeConfig{
+				WhisperURL: cfg.CascadeWhisperURL,
+				LLMURL:     cfg.CascadeLLMURL,
+				LLMModel:   cfg.CascadeLLMModel,
+				TTSURL:     cfg.CascadeTTSURL,
+				System:     cfg.CascadeSystem,
 			},
+		},
 		TrustProxy: cfg.TrustProxy,
 		Replay: offer.ReplayConfig{
-			Enabled: cfg.ReplayKafka,
+			Enabled: cfg.ReplayURL != "",
 			Timeout: cfg.ReplayTimeout,
 			Limit:   cfg.ReplayLimit,
 		},

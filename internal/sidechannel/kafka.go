@@ -2,30 +2,24 @@ package sidechannel
 
 import (
 	"context"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
-	"github.com/twmb/franz-go/pkg/kmsg"
 	"google.golang.org/protobuf/proto"
-
-	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 )
 
 // kafkaBuffer bounds the in-process queue in front of the producer. When it
 // fills (a slow/broken broker) Publish drops rather than blocking — the media
 // path must never wait on Kafka.
 const kafkaBuffer = 1024
-const replayTailWindow = 4096
 
 // Kafka publishes transcript events to a topic, partitioned by user id (falling
 // back to session id when anonymous) for per-key ordering. Delivery is
 // at-most-once and lossy under pressure: acks=1, no idempotence, drop-on-full.
+// Cross-node reconnect replay is served by cmd/replay, not this producer.
 type Kafka struct {
-	brokers []string
 	cl      *kgo.Client
 	topic   string
 	ch      chan *TranscriptEvent
@@ -54,11 +48,10 @@ func NewKafka(brokers []string, topic string) (*Kafka, error) {
 		return nil, err
 	}
 	k := &Kafka{
-		brokers: append([]string(nil), brokers...),
-		cl:      cl,
-		topic:   topic,
-		ch:      make(chan *TranscriptEvent, kafkaBuffer),
-		done:    make(chan struct{}),
+		cl:    cl,
+		topic: topic,
+		ch:    make(chan *TranscriptEvent, kafkaBuffer),
+		done:  make(chan struct{}),
 	}
 	go k.run()
 	return k, nil
@@ -93,126 +86,6 @@ func (k *Kafka) run() {
 			Value: val,
 		}, nil) // async, fire-and-forget; loss is acceptable for the side-channel
 	}
-}
-
-// Replay reads transcript events for one session with seq > afterSeq. It is a
-// best-effort bounded scan from the tail of each topic partition, intended for
-// reconnect restore (not a full historical export).
-func (k *Kafka) Replay(ctx context.Context, sessionID identity.SessionID, userID identity.UserID, provider string, afterSeq uint64, limit int) ([]*TranscriptEvent, error) {
-	if sessionID == "" || userID.Anonymous() {
-		return nil, nil
-	}
-	if limit <= 0 {
-		limit = 256
-	}
-	parts, err := k.partitions(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(parts) == 0 {
-		return nil, nil
-	}
-
-	assign := map[string]map[int32]kgo.Offset{k.topic: {}}
-	for _, p := range parts {
-		assign[k.topic][p] = kgo.NewOffset().AtEnd().Relative(-replayTailWindow)
-	}
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(k.brokers...),
-		kgo.ConsumePartitions(assign),
-		kgo.FetchMaxWait(100*time.Millisecond),
-		kgo.FetchMaxBytes(1<<20),
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer cl.Close()
-
-	deadline := time.NewTimer(600 * time.Millisecond)
-	defer deadline.Stop()
-	seen := 0
-	limitScan := replayTailWindow * len(parts)
-	matched := make([]*TranscriptEvent, 0, limit)
-	for {
-		if len(matched) >= limit || seen >= limitScan {
-			break
-		}
-		pollCtx, cancel := context.WithTimeout(ctx, 120*time.Millisecond)
-		fetches := cl.PollFetches(pollCtx)
-		cancel()
-		if err := fetches.Err(); err != nil {
-			// Timeout / no records yet is expected when scanning tails.
-			if err == context.DeadlineExceeded || err == context.Canceled {
-				select {
-				case <-deadline.C:
-					return sortedBySeq(matched), nil
-				default:
-					continue
-				}
-			}
-			return nil, err
-		}
-		if fetches.Empty() {
-			select {
-			case <-deadline.C:
-				return sortedBySeq(matched), nil
-			default:
-				continue
-			}
-		}
-		fetches.EachRecord(func(rec *kgo.Record) {
-			seen++
-			ev := &TranscriptEvent{}
-			if err := proto.Unmarshal(rec.Value, ev); err != nil {
-				return
-			}
-			if ev.GetSessionId() != string(sessionID) || ev.GetUserId() != string(userID) || ev.GetProvider() != provider || ev.GetSeq() <= afterSeq {
-				return
-			}
-			dup := false
-			for _, e := range matched {
-				if e.GetSeq() == ev.GetSeq() {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				matched = append(matched, ev)
-			}
-		})
-	}
-	return sortedBySeq(matched), nil
-}
-
-func sortedBySeq(events []*TranscriptEvent) []*TranscriptEvent {
-	sort.Slice(events, func(i, j int) bool { return events[i].GetSeq() < events[j].GetSeq() })
-	return events
-}
-
-func (k *Kafka) partitions(ctx context.Context) ([]int32, error) {
-	req := kmsg.NewMetadataRequest()
-	topicReq := kmsg.NewMetadataRequestTopic()
-	topicReq.Topic = &k.topic
-	req.Topics = append(req.Topics, topicReq)
-	resp, err := req.RequestWith(ctx, k.cl)
-	if err != nil {
-		return nil, err
-	}
-	if len(resp.Topics) == 0 || resp.Topics[0].Topic == nil || *resp.Topics[0].Topic != k.topic {
-		return nil, nil
-	}
-	t := resp.Topics[0]
-	if t.ErrorCode != 0 {
-		return nil, kerr.ErrorForCode(t.ErrorCode)
-	}
-	parts := make([]int32, 0, len(t.Partitions))
-	for _, p := range t.Partitions {
-		if p.ErrorCode != 0 {
-			continue
-		}
-		parts = append(parts, p.Partition)
-	}
-	return parts, nil
 }
 
 // partitionKey keeps one user's events ordered in a single partition. Anonymous

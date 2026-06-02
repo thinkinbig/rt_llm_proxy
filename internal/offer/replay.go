@@ -14,7 +14,7 @@ import (
 
 const replayProtocolVersion = "1"
 
-// ReplayConfig controls optional cross-node Kafka replay on reconnect.
+// ReplayConfig controls optional cross-node replay via the replay-index service.
 type ReplayConfig struct {
 	Enabled bool
 	Timeout time.Duration
@@ -47,9 +47,9 @@ type SessionLookup interface {
 	Resume(sessionID identity.SessionID, userID identity.UserID, provider string, afterSeq uint64) (full, replay []transcript.Line, startSeq uint64, ok bool)
 }
 
-// KafkaReplayer loads transcript events from an external log (optional). It must
-// only return events whose user id matches userID.
-type KafkaReplayer interface {
+// Replayer loads transcript events from the replay-index service. It must only
+// return events whose user id matches userID.
+type Replayer interface {
 	Replay(ctx context.Context, sessionID identity.SessionID, userID identity.UserID, provider string, afterSeq uint64, limit int) ([]*sidechannel.TranscriptEvent, error)
 }
 
@@ -112,7 +112,7 @@ func ResolveReplay(
 	headers ReplayHeaders,
 	cfg ReplayConfig,
 	store SessionLookup,
-	kafka KafkaReplayer,
+	index Replayer,
 	obs ReplayObserver,
 	newSessionID identity.SessionID,
 ) (ReplayOutcome, error) {
@@ -162,22 +162,22 @@ func ResolveReplay(
 		out.Status = "disabled"
 		return out, nil
 	}
-	if kafka == nil {
+	if index == nil {
 		return out, nil
 	}
 
-	obs.ObserveAttempt("kafka")
+	obs.ObserveAttempt("index")
 	kStart := time.Now()
 	replayCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	evs, err := kafka.Replay(replayCtx, headers.SessionID, userID, provider, headers.LastSeq, cfg.Limit)
+	evs, err := index.Replay(replayCtx, headers.SessionID, userID, provider, headers.LastSeq, cfg.Limit)
 	cancel()
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(replayCtx.Err(), context.DeadlineExceeded) {
-			obs.ObserveTimeout("kafka")
-			out.Status = "kafka_timeout"
+			obs.ObserveTimeout("index")
+			out.Status = "index_timeout"
 		} else {
-			obs.ObserveError("kafka")
-			out.Status = "kafka_error"
+			obs.ObserveError("index")
+			out.Status = "index_error"
 		}
 		return out, nil
 	}
@@ -185,7 +185,7 @@ func ResolveReplay(
 		return out, nil
 	}
 
-	obs.ObserveHit("kafka", time.Since(kStart))
+	obs.ObserveHit("index", time.Since(kStart))
 	out.SessionID = headers.SessionID
 	startSeq := headers.LastSeq
 	for _, ev := range evs {
@@ -197,7 +197,7 @@ func ResolveReplay(
 		}
 	}
 	out.StartSeq = startSeq
-	out.Status = "kafka_hit"
+	out.Status = "index_hit"
 	return out, nil
 }
 

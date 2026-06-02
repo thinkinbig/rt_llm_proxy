@@ -10,10 +10,7 @@
 package sidechannel
 
 import (
-	"context"
 	"log"
-
-	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 )
 
 // Publisher accepts transcript events for asynchronous delivery. Publish must
@@ -22,12 +19,6 @@ import (
 type Publisher interface {
 	Publish(ev *TranscriptEvent)
 	Close() error
-}
-
-// Replayer is an optional extension for publishers that can read transcript
-// events back by session. Implemented by Kafka to support reconnect replay.
-type Replayer interface {
-	Replay(ctx context.Context, sessionID identity.SessionID, userID identity.UserID, provider string, afterSeq uint64, limit int) ([]*TranscriptEvent, error)
 }
 
 // Nop discards every event. It is the default when no broker is configured.

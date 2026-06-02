@@ -20,8 +20,12 @@ services:
       - kafka
       - -kafka
       - kafka:9092
+      - -replay-url
+      - http://replay:8090
     depends_on:
       redis:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      replay:
+        condition: service_started

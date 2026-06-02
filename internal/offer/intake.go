@@ -25,12 +25,12 @@ type Intake struct {
 	Limiter   *ratelimit.Limiter
 	Auth      *auth.Authenticator
 	Publisher sidechannel.Publisher
-	// Kafka is an optional explicit cross-node replay source.
-	Kafka    KafkaReplayer
-	Guard    *modelcb.Manager
-	Hub      MediaHub
-	Models   ModelFactory
-	Replay   ReplayConfig
+	// ReplayIndex queries the replay-index service for cross-node reconnect restore.
+	ReplayIndex Replayer
+	Guard       *modelcb.Manager
+	Hub         MediaHub
+	Models      ModelFactory
+	Replay      ReplayConfig
 	Observer ReplayObserver
 }
 
@@ -123,7 +123,7 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 		headers,
 		in.Replay,
 		in.Hub,
-		in.kafkaReplayer(),
+		in.ReplayIndex,
 		obs,
 		newSessionID,
 	)
@@ -173,8 +173,6 @@ func streamFaultBinder(guard *modelcb.Manager, provider string) func(time.Time) 
 	}
 	return guard.StreamFaultBinder(provider)
 }
-
-func (in *Intake) kafkaReplayer() KafkaReplayer { return in.Kafka }
 
 func protocolInvalid(err error) *ProtocolInvalidError {
 	var pe *ProtocolInvalidError

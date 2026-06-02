@@ -39,8 +39,9 @@ successful dial resets both. Loopback and a nil manager skip all guard logic.
 
 ## Replay source wiring
 
-`offer.Intake` uses an explicit `KafkaReplayer` adapter (`Intake.Kafka`) for
-cross-node replay. It does not infer replay capability from `Publisher`.
+`offer.Intake` uses an explicit `Replayer` adapter (`Intake.ReplayIndex`) that
+calls the replay-index HTTP service. It does not infer replay capability from
+`Publisher`.
 
 ## Session archive
 

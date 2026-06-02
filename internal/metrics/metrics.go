@@ -16,14 +16,14 @@ var frameEdgesMs = [...]float64{20, 21, 23, 25, 30}
 var frameLabels = [...]string{"<20ms", "20-21ms", "21-23ms", "23-25ms", "25-30ms", ">=30ms"}
 
 var frameBuckets [len(frameLabels)]atomic.Uint64
-var replaySources = [...]string{"memory", "kafka"}
+var replaySources = [...]string{"memory", "index"}
 var replayLatencyEdgesMs = [...]float64{20, 50, 100, 200, 300}
 var replayLatencyLabels = [...]string{"<20ms", "20-50ms", "50-100ms", "100-200ms", "200-300ms", ">=300ms"}
 
 var replayAttempts [len(replaySources)]atomic.Uint64
 var replayHits [len(replaySources)]atomic.Uint64
-var replayTimeouts [len(replaySources)]atomic.Uint64 // kafka-only in practice
-var replayErrors [len(replaySources)]atomic.Uint64   // kafka-only in practice
+var replayTimeouts [len(replaySources)]atomic.Uint64 // index-only in practice
+var replayErrors [len(replaySources)]atomic.Uint64   // index-only in practice
 var replayLatencyBuckets [len(replaySources)][len(replayLatencyLabels)]atomic.Uint64
 
 var outboundFramesWritten atomic.Uint64
@@ -79,7 +79,7 @@ func FrameIntervalBuckets() map[string]uint64 {
 	return out
 }
 
-// ObserveReplayAttempt records one replay attempt for source memory|kafka.
+// ObserveReplayAttempt records one replay attempt for source memory|index.
 func ObserveReplayAttempt(source string) {
 	if i, ok := replaySourceIndex(source); ok {
 		replayAttempts[i].Add(1)
@@ -96,14 +96,14 @@ func ObserveReplayHit(source string, d time.Duration) {
 	observeReplayLatency(i, d)
 }
 
-// ObserveReplayTimeout records a replay timeout (kafka path).
+// ObserveReplayTimeout records a replay timeout (index path).
 func ObserveReplayTimeout(source string) {
 	if i, ok := replaySourceIndex(source); ok {
 		replayTimeouts[i].Add(1)
 	}
 }
 
-// ObserveReplayError records a replay error (kafka path).
+// ObserveReplayError records a replay error (index path).
 func ObserveReplayError(source string) {
 	if i, ok := replaySourceIndex(source); ok {
 		replayErrors[i].Add(1)
