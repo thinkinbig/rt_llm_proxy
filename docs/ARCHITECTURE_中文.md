@@ -1,18 +1,18 @@
 # 架构与工程笔记 — rt-llm-proxy
 
-rt-llm-proxy 的组成方式，以及**为什么**每个非显而易见的工程决策是这样的。意图保持简洁 — 这是一个小项目。
+本文说明 rt-llm-proxy 的组成方式，以及**为什么**每个非显而易见的工程决策会这样设计。篇幅刻意保持精简——毕竟这是个小型项目。
 
 | § | 主题 |
 |---|---|
-| **1** | 代理核心 — WebRTC 网桥、控制平面、容错 |
-| **2** | **级联管道** — 协调器（进程内）+ 侧车（ASR/LLM/TTS/转折检测） |
+| **1** | 代理核心 — WebRTC 桥接、控制平面、容错 |
+| **2** | **级联管道** — 编排器（进程内）+ 侧车（ASR/LLM/TTS/话轮检测） |
 | **3** | 模块与接缝 |
-| **4** | 工程优化（步调、Opus、重放、…） |
+| **4** | 工程优化（节拍、Opus、重放、…） |
 | **5** | 测试 |
 
 ## 1. 架构
 
-**不变量（承载）：** 控制/个性化平面绝不能阻止实时媒体平面（§4.3）。下面的容错遵循这条规则 — 降级功能而不是呼叫，除非失败是显式硬卫兵（容量时的速率限制、断路器打开）。
+**核心不变量（硬约束）：** 控制/个性化平面绝不能阻塞实时媒体平面（§4.3）。下文中的容错策略都遵循这条原则——优先降级功能，而非中断通话；除非失败触发了明确的硬性拦截（容量触顶时的速率限制、断路器打开）。
 
 ### 1.1 系统概览
 
@@ -61,15 +61,15 @@ flowchart TB
 
   WEB <-->|"Opus ↔ JSON {seq,role,text}"| BRIDGE
   BRIDGE <-->|"单声道 s16 PCM @ 48 kHz"| STS
-  BRIDGE <-->|"同 Model 接缝"| CASCADE
+  BRIDGE <-->|"同一 Model 接缝"| CASCADE
   RL <-->|"INCR+EXPIRE (Lua)"| REDIS
-  TAP -->|"发布(非阻止)"| KAFKA
+  TAP -->|"发布（非阻塞）"| KAFKA
   REPLAY -.->|"内存存档 · 可选重放索引"| HUB
   REPLAY -.-> KAFKA
   CB -.->|"连接 + 早期流故障"| STS
 ```
 
-实线箭头在热路径上；虚线箭头是最佳努力或可选。Redis 和 Kafka **从不**在 20ms 音频循环上。
+实线箭头表示热路径；虚线表示尽力而为或可选路径。Redis 和 Kafka **从不**参与 20ms 音频循环。
 
 ### 1.2 媒体数据路径
 
@@ -78,11 +78,11 @@ flowchart TB
       ◀──────────── Opus 音频 ────────────              ◀──── PCM ──────
 ```
 
-STS 提供商（gemini、doubao）通过 WebSocket 与提供商原生 PCM 通信；`?model=cascade` 使用**相同的** `Model` 接缝，但在 `internal/model/cascade` 内链接 HTTP 阶段。
+STS 提供商（gemini、doubao）通过 WebSocket 传输各自原生的 PCM 格式；`?model=cascade` 走**同一套** `Model` 接缝，但在 `internal/model/cascade` 内部串联 HTTP 阶段。
 
-- **入站（麦克风 → 模型）：** `track.ReadRTP` → Opus 解码 → 单声道 s16 PCM @48kHz → `Model.SendAudio`。提供商适配器重采样到其自己的传输速率。
-- **出站（模型 → 扬声器）：** `Model.Recv` → 累积到缓冲区 → Opus 编码每个 20ms / 960 样本帧 → `WriteSample`，**以实时速率步调**（会话 `time.Ticker`，§4.1）。可选的 `-adaptive` 在负载下降低编码器复杂度（§4.11）。
-- **数据通道：** 浏览器输入文本 → `Recorder.Record("user")` + `Model.SendText`；提供商 STT（`RecvTranscript`）→ `Recorder.Record` → 浏览器为 JSON `{seq,role,text}` 以便重连可从 `last_seq` 恢复。
+- **入站（麦克风 → 模型）：** `track.ReadRTP` → Opus 解码 → 单声道 s16 PCM @48kHz → `Model.SendAudio`。提供商适配器再重采样到各自的传输采样率。
+- **出站（模型 → 扬声器）：** `Model.Recv` → 累积到缓冲区 → 按 20ms / 960 样本帧 Opus 编码 → `WriteSample`，**以实时速率推送**（会话级 `time.Ticker`，§4.1）。可选的 `-adaptive` 会在高负载下降低编码器复杂度（§4.11）。
+- **数据通道：** 浏览器输入文本 → `Recorder.Record("user")` + `Model.SendText`；提供商 STT（`RecvTranscript`）→ `Recorder.Record` → 以 JSON `{seq,role,text}` 推回浏览器，以便重连时从 `last_seq` 恢复。
 
 ### 1.3 控制与重连路径
 
@@ -98,45 +98,45 @@ sequenceDiagram
   O->>O: 速率限制（满时返回 429）
   O->>O: 认证 → user_id（或 ""）
   O->>O: 模型守卫（打开时返回 503）
-  O->>M: Models.New（拨号错误时返回 502）
+  O->>M: Models.New（拨号失败时返回 502）
   O->>R: 内存存档 → 可选重放索引
-  Note over R: 超时 / 缺失 → 状态缺失,<br/>媒体仍启动
+  Note over R: 超时 / 缺失 → 状态缺失，<br/>媒体照常启动
   O->>H: Serve(SDP, model, 重放历史)
   O-->>B: answer SDP + X-Session-ID + X-Replay-Status
   H-->>B: WebRTC 媒体（后台）
 ```
 
-重连是**最佳努力**：格式错误的重放头 → `400`；不完整的头 → 新会话；重放索引超预算 → `index_timeout` / `index_error`，但呼叫继续。
+重连采用**尽力而为**策略：重放头格式错误 → `400`；头不完整 → 开新会话；重放索引超预算 → `index_timeout` / `index_error`，但通话继续。
 
 ### 1.4 容错与降级
 
-| 层 | 组件 | 触发 | 策略 | 阻止媒体？ |
+| 层 | 组件 | 触发条件 | 策略 | 阻塞媒体？ |
 |---|---|---|---|---|
-| 控制 | `ratelimit` | Redis 错误 | **失败开放**（允许 + 日志） | 否 |
-| 控制 | `ratelimit` | 窗口满 | `429` | 是（仅 offer） |
-| 控制 | `auth` | 缺少/无效令牌 | **匿名** `user_id=""` | 否 |
-| 控制 | `modelcb` | 断路器打开/半开门控 | `503` + `Retry-After` | 是（仅 offer） |
-| 控制 | `modelcb` | N 连接失败/认证错误 | 打开每个提供商 | 是（仅 offer） |
-| 控制 | `modelcb` | 首音频前流错误（10s 内） | `StreamFaultAt` → `RecordStreamFault` | 否 |
-| 控制 | `ResolveReplay` | 超时/缺失/禁用 | `X-Replay-Status` 降级 | 否 |
-| 侧 | `sidechannel` / Kafka | 缓冲区满/关闭 | **丢弃** + `dropped_total` | 否 |
-| 数据 | `rtc.Bridge` | 提供商沉默 | Ticker 合并滴答（无突发） | 否 |
-| 数据 | Opus | 数据包丢失 | 带外 FEC + DTX（上行 fmtp，下行编码器） | 否 |
-| 数据 | `adaptive` | 高会话计数或帧漂移 | 降低 Opus 复杂度 | 否（质量权衡） |
-| 数据 | 生命周期 | 断开/SIGTERM | `sync.Once` 清理 · `CloseAll` | N/A |
+| 控制 | `ratelimit` | Redis 错误 | **故障时放行**（允许 + 记日志） | 否 |
+| 控制 | `ratelimit` | 窗口已满 | `429` | 是（仅 offer） |
+| 控制 | `auth` | 令牌缺失/无效 | **匿名** `user_id=""` | 否 |
+| 控制 | `modelcb` | 断路器打开 / 半开受限 | `503` + `Retry-After` | 是（仅 offer） |
+| 控制 | `modelcb` | 连续 N 次连接失败 / 认证错误 | 按提供商打开断路器 | 是（仅 offer） |
+| 控制 | `modelcb` | 首帧音频前流错误（10s 内） | `StreamFaultAt` → `RecordStreamFault` | 否 |
+| 控制 | `ResolveReplay` | 超时 / 缺失 / 已禁用 | `X-Replay-Status` 降级 | 否 |
+| 侧 | `sidechannel` / Kafka | 缓冲区满 / 已关闭 | **丢弃** + `dropped_total` | 否 |
+| 数据 | `rtc.Bridge` | 提供商沉默 | Ticker 合并多余 tick（避免突发） | 否 |
+| 数据 | Opus | 丢包 | 带内 FEC + DTX（上行 fmtp，下行编码器） | 否 |
+| 数据 | `adaptive` | 会话数过高或帧延迟 | 降低 Opus 复杂度 | 否（质量换性能） |
+| 数据 | 生命周期 | 断开 / SIGTERM | `sync.Once` 清理 · `CloseAll` | N/A |
 
 ```mermaid
 flowchart LR
-  subgraph hard["硬卫兵 — 仅 offer"]
+  subgraph hard["硬性拦截 — 仅 offer"]
     RL429["速率限制满 → 429"]
     CB503["断路器打开 → 503"]
   end
-  subgraph soft["软降级 — 呼叫继续"]
-    RLO["Redis 故障 → 允许"]
+  subgraph soft["软降级 — 通话继续"]
+    RLO["Redis 故障 → 放行"]
     ANON["认证失败 → 匿名"]
-    REP["重放缺失 → 新/部分历史"]
+    REP["重放缺失 → 新会话 / 部分历史"]
     DROP["Kafka 满 → 丢弃事件"]
-    ADP["负载 → 降低 Opus 复杂度"]
+    ADP["高负载 → 降低 Opus 复杂度"]
   end
   subgraph media["媒体路径 — 无外部 RTT"]
     BR["Bridge ↔ 提供商 PCM 循环"]
@@ -146,27 +146,27 @@ flowchart LR
   OFFER --> media
 ```
 
-**故障转移级别 (L1–L4) 和生产缩放注意事项在 [README § 缩放与故障转移](../README.md) 中。**
+故障转移级别（L1–L4）及生产环境扩缩容说明见 [README § 缩放与故障转移](../README.md)。
 
 ---
 
 ## 2. 级联管道
 
-`?model=cascade` 选择一个**自托管 ASR → LLM → TTS** 堆栈，作为第四个提供商适配器。它实现 `model.Model` 和 `model.Transcriber` — Bridge、转录记录器、侧通道和重连机制**不变**。仅 Model 接缝后的对象不同。
+`?model=cascade` 选择一套**自托管 ASR → LLM → TTS** 堆栈，作为第四个提供商适配器接入。它实现 `model.Model` 和 `model.Transcriber`——Bridge、转录记录器、侧通道和重连机制**完全不变**，只是 Model 接缝背后的实现换了。
 
-本章是深度探讨；操作标志和 Docker Compose 在 [README § Cascade](../README.md#cascade)。
+本章是深度说明；运维参数和 Docker Compose 见 [README § Cascade](../README.md#cascade)。
 
-### 2.1 协调器 vs 侧车
+### 2.1 编排器与侧车
 
-部署分为**一个进程内协调器**和**四个外部侧车**。除了转折编排外，一切都在进程外运行；代理进程仅托管协调器和薄 HTTP/WebSocket 客户端。
+部署上分为**一个进程内编排器**和**四个外部侧车**。除话轮编排外，各阶段都在独立进程中运行；代理进程只托管编排器和轻量 HTTP/WebSocket 客户端。
 
-| 层 | 运行位置 | 做什么 |
+| 层 | 运行位置 | 职责 |
 |---|---|---|
-| **协调器** | 代理内部 `internal/model/cascade` | `run()` 转折循环、`respond()` LLM→TTS 管道、抢断、历史、业务接缝（`OnLLMToken`、`SetAudioSource`）。实现 `model.Model` — Bridge 如同对待 gemini/doubao。 |
-| **阶段客户端** | `internal/model/cascade/{asr,llm,tts,turndetect}/` — 与协调器同一进程 | 薄适配器，与每个侧车的传输协议通信。不是单独的服务；通过 `cascade.Config` 连接。 |
-| **侧车** | Docker 网络内的单独容器 | ASR（`realtimestt/`）、LLM（vLLM）、TTS（xtts-streaming-server）、转折检测（`turndetect/`，可选）。仅代理端口暴露于公共。 |
+| **编排器** | 代理进程内 `internal/model/cascade` | `run()` 话轮循环、`respond()` LLM→TTS 管道、插话打断、历史管理、业务接缝（`OnLLMToken`、`SetAudioSource`）。实现 `model.Model`——Bridge 把它当作 gemini/doubao 一样对待。 |
+| **阶段客户端** | `internal/model/cascade/{asr,llm,tts,turndetect}/`，与编排器同进程 | 与各侧车通信协议的薄适配层。不是独立服务，通过 `cascade.Config` 注入。 |
+| **侧车** | Docker 内网中的独立容器 | ASR（`realtimestt/`）、LLM（vLLM）、TTS（xtts-streaming-server）、话轮检测（`turndetect/`，可选）。仅代理端口对外暴露。 |
 
-`rtc.Bridge` 和控制平面（速率限制、重放、Kafka 侧通道）是**共享代理基础设施** — 不是级联协调器或其侧车的一部分。
+`rtc.Bridge` 和控制平面（速率限制、重放、Kafka 侧通道）属于**共享代理基础设施**——不属于级联编排器或其侧车。
 
 ### 2.2 端到端数据流
 
@@ -176,15 +176,15 @@ flowchart LR
     M["Model 接缝<br/>SendAudio · Recv · SendText"]
   end
 
-  subgraph orchestrator["协调器 — 进程内 (internal/model/cascade)"]
+  subgraph orchestrator["编排器 — 进程内 (internal/model/cascade)"]
     RUN["run() — 历史所有者"]
     ASR["ASR 客户端"]
-    TD["转折检测器客户端<br/>(可选)"]
+    TD["话轮检测客户端<br/>(可选)"]
     RESP["respond() — LLM + TTS"]
     RUN --> ASR
-    ASR -->|"部分 · 完整 · 说话开始"| RUN
+    ASR -->|"部分结果 · 最终结果 · speech_start"| RUN
     RUN --> TD
-    TD -->|"建议暂停"| RUN
+    TD -->|"建议暂停时长"| RUN
     RUN --> RESP
     RESP -->|"PCM 块"| M
   end
@@ -203,258 +203,257 @@ flowchart LR
   TD --- TURN
 ```
 
-所有侧车跳跃是 LAN 本地的单个 GPU 主机上（~1–5ms）。重采样和传输格式保持**在每个阶段客户端内** — Bridge 仅看到单声道 s16 PCM @ 48 kHz（与 gemini/doubao 相同的合约）。
+侧车间跳转都在单 GPU 主机的局域网内完成（约 1–5ms）。重采样和线格式转换留在**各阶段客户端内部**——Bridge 始终只看到单声道 s16 PCM @ 48 kHz（与 gemini/doubao 相同的约定）。
 
-### 2.3 阶段和注入
+### 2.3 阶段与依赖注入
 
-`cascade.Config` 接受可注入的阶段接口 — 与 `ratelimit.New(addr, …)` 相同的模式，在 `offer.ProdModelFactory` 中连接生产默认值：
+`cascade.Config` 接受可注入的阶段接口——与 `ratelimit.New(addr, …)` 同一模式，生产默认值在 `offer.ProdModelFactory` 中装配：
 
-| 接口 | 阶段客户端（协调器） | 侧车 |
+| 接口 | 阶段客户端（编排器侧） | 侧车 |
 |---|---|---|
-| `ASR` | `asr.NewWhisper(url)` | `realtimestt/` — Silero VAD + faster-whisper；部分、完整、`speech_start` |
+| `ASR` | `asr.NewWhisper(url)` | `realtimestt/` — Silero VAD + faster-whisper；部分结果、最终结果、`speech_start` |
 | `LLM` | `llm.New(url, model)` | vLLM — OpenAI 兼容 API（默认 Qwen3.5-9B） |
-| `TTS` | `tts.NewXTTSStream(url, …)` | xtts-streaming-server — 通过 `/tts_stream` 增量 PCM |
-| `TurnDetector` | `turndetect.NewHTTP(url)` 或 `NopTurnDetector{}` | `turndetect/` — 句子完成分类器（可选） |
+| `TTS` | `tts.NewXTTSStream(url, …)` | xtts-streaming-server — 通过 `/tts_stream` 增量输出 PCM |
+| `TurnDetector` | `turndetect.NewHTTP(url)` 或 `NopTurnDetector{}` | `turndetect/` — 句子结束分类器（可选） |
 
-测试在 `fakestage/` 存根中交换（无侧车）。Docker 堆栈：`docker-compose.cascade.yml` — 代理容器中的协调器，内部网络上的四个侧车。
+测试时用 `fakestage/` 存根替换（无需侧车）。Docker 栈见 `docker-compose.cascade.yml`——编排器在代理容器内，四个侧车在内网。
 
-### 2.4 转折编排
+### 2.4 话轮编排
 
-一个 `run()` goroutine 拥有 `history` 和所有转折状态 — 对话数据无锁。它读取 ASR 事件、输入的 `SendText`、转折检测计时器和来自 `modelTurnCh` 的完成模型回复。
+单个 `run()` goroutine 独占 `history` 和所有话轮状态——对话数据无需加锁。它消费 ASR 事件、输入的 `SendText`、话轮检测计时器，以及 `modelTurnCh` 传来的模型回复。
 
 ```mermaid
 sequenceDiagram
   participant ASR as RealtimeSTT
   participant RUN as cascade.run()
-  participant TD as 转折检测器
+  participant TD as 话轮检测
   participant RESP as respond()
   participant LLM as vLLM
   participant TTS as XTTS
 
-  ASR->>RUN: ASRPartial (稳定句子?)
-  opt 推测性
+  ASR->>RUN: ASRPartial（句子已稳定？）
+  opt 预判式启动
     RUN->>RESP: 启动 respond() 快照
     RESP->>LLM: Generate(历史)
   end
   ASR->>RUN: ASRFinal
   RUN->>TD: SuggestedPause(文本)
-  TD-->>RUN: 暂停 (或 0)
+  TD-->>RUN: 暂停时长（或 0）
   RUN->>RESP: 启动 respond() 快照
   RESP->>LLM: Generate(历史)
-  loop 每个句子分段
+  loop 按句子分段
     LLM-->>RESP: 令牌增量
     RESP->>TTS: Synthesize(分段)
     TTS-->>RESP: PCM 块 → recvCh
   end
   RESP->>RUN: modelTurnCh ← 完整回复
-  RUN->>RUN: 将模型转折附加到历史
+  RUN->>RUN: 将模型话轮追加到历史
 
-  Note over ASR,RUN: ASRSpeechStarted → bargeIn()<br/>取消 RESP, 排空 recvCh
+  Note over ASR,RUN: ASRSpeechStarted → bargeIn()<br/>取消 RESP，排空 recvCh
 ```
 
-| 事件 | 行动 |
+| 事件 | 处理 |
 |---|---|
-| `ASRPartial` | 通过 `RecvTranscript` 直播字幕；取消待处理转折计时器；当部分稳定时（~200ms、以句子结尾标点）可选**推测性** LLM 启动 |
-| `ASRSpeechStarted` | **抢断**：取消进行中的 `respond()`、排空 `recvCh` |
-| `ASRFinal` | 去重（Jaccard ≥ 0.9）；确认或丢弃推测；在转折检测暂停后（或立即）安排 LLM |
-| `SendText` | 与 ASR 最终相同路径（输入的数据通道输入） |
+| `ASRPartial` | 通过 `RecvTranscript` 实时字幕；取消待处理话轮计时器；部分结果稳定时（约 200ms、以句末标点结尾）可**预判式**启动 LLM |
+| `ASRSpeechStarted` | **插话打断**：取消进行中的 `respond()`，排空 `recvCh` |
+| `ASRFinal` | 去重（Jaccard ≥ 0.9）；确认或丢弃预判；在话轮检测暂停后（或立即）调度 LLM |
+| `SendText` | 与 ASR 最终结果走同一路径（数据通道输入） |
 
-`respond()` 接收历史**快照**并从不改变它。完成的回复通过 `modelTurnCh` 传回，以便 `run()` 保持为唯一历史编写器。
+`respond()` 接收历史的**快照**，从不修改它。完成的回复经 `modelTurnCh` 回传，由 `run()` 作为唯一的历史写入者。
 
 ### 2.5 低延迟设计
 
-四个机制堆叠以减少首音频时间 (TTFA)：
+四个机制叠加，缩短首帧音频时间（TTFA）：
 
-1. **推测性 LLM 启动** — 看起来像完整句子的稳定 ASR 部分提交临时用户转折并在 `ASRFinal` 前启动 LLM。匹配最终修补文本并保持进行中的生成；不匹配丢弃推测并从头开始。
+1. **预判式 LLM 启动** — 看起来像完整句子的稳定 ASR 部分结果，会提前提交临时用户话轮并在 `ASRFinal` 之前启动 LLM。若与最终结果匹配，则修补文本并保留进行中的生成；不匹配则丢弃预判，从头开始。
 
-2. **句子分段流式 TTS** — `respond()` 在句子边界（`. ? !` 换行 / CJK 标点）分割 LLM 令牌。分割器将完成的句子推送到并发 TTS 工作线程，LLM 继续生成下一个。LLM 从不被阻止等待合成。
+2. **按句分段的流式 TTS** — `respond()` 在句界（`. ? !`、换行 / 中日韩标点）切分 LLM 令牌。分段器把完整句子推给并发 TTS worker，LLM 继续生成下一句。LLM 不会被合成阻塞。
 
-3. **XTTS 流式** — 每个句子在合成时增量流式 PCM，所以播放在句子完全渲染前开始。当实现时的可选 `QuickSynthesizer` 路径。
+3. **XTTS 流式输出** — 每个句子边合成边增量推送 PCM，句子尚未完全渲染即可开始播放。实现后还可选 `QuickSynthesizer` 路径处理首段。
 
-4. **转折检测（可选）** — `-cascade-turndetect` 在 ASR 最终后添加有界暂停，再然后提交转折。`NopTurnDetector`（未设置时的默认值）立即触发。
+4. **话轮检测（可选）** — `-cascade-turndetect` 在 ASR 最终结果后插入有界暂停，再提交话轮。未配置时默认 `NopTurnDetector`，立即触发。
 
-### 2.6 抢断
+### 2.6 插话打断（Barge-in）
 
-由 RealtimeSTT 的 `ASRSpeechStarted` 触发（用户在机器人说话时开始说话）。取消序列镜像 RealtimeVoiceChat `process_abort_generation()`：
+由 RealtimeSTT 的 `ASRSpeechStarted` 触发（用户在机器人说话时开口）。取消顺序对齐 RealtimeVoiceChat 的 `process_abort_generation()`：
 
 1. 取消 `genCtx` → 停止 LLM HTTP 流和 TTS 合成。
-2. 等待 `genDone` → `respond()` goroutine 已退出。
-3. 排空 `recvCh` → 在下一个转折开始前丢弃排队的音频。
+2. 等待 `genDone` → 确认 `respond()` goroutine 已退出。
+3. 排空 `recvCh` → 丢弃排队音频，再开始下一话轮。
 
-第 2 步是承载：没有它，旧 `respond()` 可能在新转折开始后写入 `recvCh`。分割器和 `respond()` 中的 TTS 工作线程都在 `genCtx` 下运行，所以抢断一起取消它们。
+第 2 步是**关键约束**：缺少它时，旧的 `respond()` 可能在新话轮开始后仍往 `recvCh` 写数据。分段器和 `respond()` 内的 TTS worker 都在 `genCtx` 下运行，插话打断会一并取消它们。
 
-重复话语（Jaccard 令牌相似度 ≥ 0.9）被忽略 — 机器人不会重新启动它已经为本质相同的输入给出的回复。
+重复话语（Jaccard 令牌相似度 ≥ 0.9）会被忽略——机器人不会对实质相同的输入重复开答。
 
 ### 2.7 业务接缝
 
-级联暴露两个钩子，保持核心代理业务无关，同时启用下游用例（如个性化实时 DJ）。代码示例在 [README § Cascade](../README.md#cascade)。
+级联暴露两个钩子，让核心代理保持业务无关，同时支持下游场景（例如个性化实时 DJ）。代码示例见 [README § Cascade](../README.md#cascade)。
 
 **LLM 拦截 — `Config.OnLLMToken`**
 
-在 TTS 前每个令牌调用。返回 `("", false)` 通过，`(替代, true)` 替换，`("", true)` 静默丢弃。历史始终接收原始令牌。
+每个令牌在进 TTS 前调用。返回 `("", false)` 原样通过，`(替代文本, true)` 替换，`("", true)` 静默丢弃。历史始终记录原始令牌。
 
-**输出混合 — `Cascade.SetAudioSource`**
+**输出混音 — `Cascade.SetAudioSource`**
 
-注入任何 `AudioSource`（单声道 s16、48 kHz）到出站音频。`Recv()` 从它读取直到 `io.EOF`，然后无缝回退到 TTS。替换或清除源会关闭前一个。
+向出站音频注入任意 `AudioSource`（单声道 s16、48 kHz）。`Recv()` 从中读取直至 `io.EOF`，再无缝回退到 TTS。替换或清除源时会关闭前一个。
 
 ### 2.8 容错与重连
 
-| 失败 | 策略 | 阻止会话？ |
+| 故障 | 策略 | 阻塞会话？ |
 |---|---|---|
-| LLM/TTS 瞬态 HTTP 错误 | 重试一次，然后跳过分段 | 否 |
-| LLM/TTS 硬错误中转 | 跳过分段，转折可能不完整 | 否 |
-| GPU 主机崩溃 | 所有级联会话结束 | 是（SPOF） |
-| 重连带重放头 | 转录行通过 `seq` 恢复 | 否 |
-| 重连 LLM 上下文 | **未恢复** — 历史在 GPU 主机上 | 否（降级） |
+| LLM/TTS 瞬时 HTTP 错误 | 重试一次，仍失败则跳过该分段 | 否 |
+| LLM/TTS 话轮中途硬错误 | 跳过该分段，话轮可能不完整 | 否 |
+| GPU 主机崩溃 | 所有级联会话结束 | 是（单点故障） |
+| 重连带重放头 | 转录行按 `seq` 恢复 | 否 |
+| 重连后 LLM 上下文 | **不恢复** — 历史在 GPU 主机内存中 | 否（降级） |
 
-级联重连使用与其他提供商相同的 `X-Session-ID` / `X-Last-Seq` 路径（提供商范围）。转录文本重放；LLM 从 `-cascade-system` 加上任何重放行（Bridge 注入）开始，而不是与旧会话一起死亡的内存中 `history` 切片。
+级联重连与其他提供商共用 `X-Session-ID` / `X-Last-Seq`（按提供商隔离）。转录文本可重放；LLM 从 `-cascade-system` 加重放行开始，而非旧会话中已随进程消亡的内存 `history`。
 
-对于多主机复原力，三个阶段需要独立的重连和状态 — 超出当前单 GPU 部署的范围。
+多主机容灾需要三个阶段各自独立的重连与状态——超出当前单 GPU 部署范围。
 
 ---
 
 ## 3. 模块与接缝
 
-| 模块 | 包 | 角色 |
+| 模块 | 包 | 职责 |
 |---|---|---|
-| **Bridge** | `internal/rtc` | 终止一个浏览器 WebRTC 对等连接；双向泵送音频 + 数据通道文本。**仅**与 Model 接缝通话。拥有转录**记录器**（单一记录点）。 |
-| **会话存档** | `internal/rtc` (`sessionArchiveStore`) | 断开连接会话的内存重连存档，带 TTL + 所有权检查；由 `Resume`/`SessionState` 使用。 |
-| **转录** | `internal/transcript` | 会话范围 `Line{seq,role,text}` 和 `Recorder` — 数据通道、重连历史和侧通道共享的单个 seq 权威。 |
-| **会话 offer 摄入** | `internal/offer` (`Intake`) | 控制平面链：速率限制、提供商守卫、重连重放、然后 `Hub.Serve`。 |
+| **Bridge** | `internal/rtc` | 终止一个浏览器 WebRTC 对等连接；双向泵送音频与数据通道文本。**仅**与 Model 接缝交互。拥有转录**记录器**（唯一记录点）。 |
+| **会话存档** | `internal/rtc` (`sessionArchiveStore`) | 断开会话的内存重连存档，带 TTL 与所有权校验；供 `Resume`/`SessionState` 使用。 |
+| **转录** | `internal/transcript` | 会话级 `Line{seq,role,text}` 与 `Recorder`——数据通道、重连历史、侧通道共享的 seq 权威来源。 |
+| **会话 offer 摄入** | `internal/offer` (`Intake`) | 控制平面链：速率限制 → 提供商守卫 → 重连重放 → `Hub.Serve`。 |
 | **Offer HTTP 适配器** | `internal/offer` (`Handler`) | 将 POST / 映射到 `Intake.ServeOffer`。 |
-| **提供商守卫** | `internal/modelcb` | 每个提供商断路器：offer 上的 `AllowDial` / `RecordDial`；Bridge 上通过 `StreamFaultAt` 的早期流错误。 |
-| **认证** | `internal/auth` | Bearer → offer 路径上的 `user_id`；失败开放匿名。 |
-| **自适应** | `internal/adaptive` | 可选 Opus 编码复杂度控制器在负载下（`-adaptive`）。 |
-| **Model 接缝** | `internal/model` | 提供商无关的 `Model` 接口（`SendAudio`/`SendText`/`Recv`/`Close`）。可选 `Transcriber`（`RecvTranscript`）用于 STT。 |
-| **提供商/适配器** | `internal/model/gemini`, `internal/model/doubao` | 每个流式 STS API 一个具体 `Model`。每个拥有其 WebSocket 协议和原生音频格式。 |
-| **级联** | `internal/model/cascade` | 进程内**协调器** — 转折循环、抢断、业务接缝。见 [#cascade](#cascade)。 |
-| **级联阶段** | `internal/model/cascade/asr`, `llm`, `tts`, `turndetect` | 进程内阶段客户端；侧车在 [§2.1](#orchestrator-vs-sidecars)。 |
-| **侧通道** | `internal/sidechannel` | `Tap` 实现 `transcript.Listener`；使用 Bridge 分配的 seq 发布 `TranscriptEvent` 到 Kafka/stdout。 |
-| **重放索引** | `cmd/replay`, `internal/replayindex` | Kafka 消费者 + HTTP 存储；为跨节点重连提供 `GET /v1/replay`。 |
-| **PCM 帮助器** | `internal/model/pcm` | `ToBytes` / `FromBytes` — s16le 上行序列化。共享仅因为两个适配器都序列化合约侧 s16；**不是**统一解码层。 |
-| **音频** | `internal/audio` | Opus 编解码（通过 cgo 的 libopus）+ 线性重采样。 |
-| **速率限制** | `internal/ratelimit` | SDP offer 端点的 Redis 固定窗口限制器。**仅控制平面。** |
-| **组合根** | `cmd/proxy` (`runProxy`) | 从配置连接运行时适配器并拥有进程关闭顺序。 |
+| **提供商守卫** | `internal/modelcb` | 按提供商的断路器：offer 上 `AllowDial` / `RecordDial`；Bridge 上通过 `StreamFaultAt` 报告早期流故障。 |
+| **认证** | `internal/auth` | Bearer → offer 路径上的 `user_id`；失败时匿名放行。 |
+| **自适应** | `internal/adaptive` | 可选的 Opus 编码复杂度控制器（`-adaptive`），高负载时降档。 |
+| **Model 接缝** | `internal/model` | 与提供商无关的 `Model` 接口（`SendAudio`/`SendText`/`Recv`/`Close`）。可选 `Transcriber`（`RecvTranscript`）用于 STT。 |
+| **提供商适配器** | `internal/model/gemini`, `internal/model/doubao` | 每个流式 STS API 一个具体 `Model` 实现，各自拥有 WebSocket 协议与原生音频格式。 |
+| **级联** | `internal/model/cascade` | 进程内**编排器**——话轮循环、插话打断、业务接缝。见 [#cascade](#cascade)。 |
+| **级联阶段** | `internal/model/cascade/asr`, `llm`, `tts`, `turndetect` | 进程内阶段客户端；侧车见 [§2.1](#orchestrator-vs-sidecars)。 |
+| **侧通道** | `internal/sidechannel` | `Tap` 实现 `transcript.Listener`；用 Bridge 分配的 seq 将 `TranscriptEvent` 发布到 Kafka/stdout。 |
+| **重放索引** | `cmd/replay`, `internal/replayindex` | Kafka 消费者 + HTTP 存储；跨节点重连提供 `GET /v1/replay`。 |
+| **PCM 工具** | `internal/model/pcm` | `ToBytes` / `FromBytes`——s16le 上行序列化。两个适配器共用只是因为合约侧都是 s16；**不是**统一解码层。 |
+| **音频** | `internal/audio` | Opus 编解码（cgo 调用 libopus）+ 线性重采样。 |
+| **速率限制** | `internal/ratelimit` | SDP offer 端点的 Redis 固定窗口限流。**仅控制平面。** |
+| **组合根** | `cmd/proxy` (`runProxy`) | 从配置装配运行时依赖，并管理进程关闭顺序。 |
 
-### 音频合约（承载）
+### 音频约定（硬约束）
 
-**跨越 Model 接缝的每个音频块都是单声道有符号 16 位 PCM，采样率 48kHz**（WebRTC 的原生 Opus 速率）。提供商在内部转换为/来自其自己的格式，所以 Bridge 永不知道提供商的传输格式。这个单一规范格式是保持 Bridge 完全提供商无关的原因。
+**穿过 Model 接缝的每个音频块都是单声道有符号 16 位 PCM，采样率 48kHz**（WebRTC Opus 的原生速率）。提供商在内部转换格式，Bridge 无需知道各家的线格式。正是这一 canonical 格式让 Bridge 完全与提供商解耦。
 
-### 提供商不对称是有意的，不是重复
+### 提供商不对称是刻意设计，不是重复代码
 
-| 提供商 | 下游 → 合约 | 速率源 |
+| 提供商 | 下行 → 合约格式 | 采样率来源 |
 |---|---|---|
-| Gemini | s16le | 从 MIME 类型（`inlineAudioToModelPCM`）每块读取 |
-| 豆包 | f32le | 固定 `24000` 常数（`ttsToModelPCM`、`f32leToPCM`） |
+| Gemini | s16le | 从 MIME 类型按块读取（`inlineAudioToModelPCM`） |
+| 豆包 | f32le | 固定常量 `24000`（`ttsToModelPCM`、`f32leToPCM`） |
 
-Gemini 从传输线读取速率是更安全的模式；豆包的协议*不能*携带它，所以其速率是不可验证的常数（通过转储 + 分析原始流一次确认）。**不要为了看起来对称就将 Gemini 的每块速率压平成静态常数** — 那会删除更安全的行为。
+Gemini 从线格式读取采样率是更稳妥的做法；豆包协议**无法**携带采样率，只能用不可校验的常量（dump 原始流分析一次即可确认）。**不要为了「看起来对称」把 Gemini 的按块采样率压成静态常量**——那会丢掉更安全的行为。
 
 ---
 
 ## 4. 工程优化点
 
-每个条目：我们做什么，以及它避免的失败模式。
+每条记录说明：我们做了什么，以及它避免了哪种失败模式。
 
-### 4.1 实时出站步调，无时钟漂移
+### 4.1 出站实时节拍，无时钟漂移
 
-我们用**单个会话级 `time.Ticker`** 步调出站帧，而不是每帧 `time.After(frameDur)`。
+出站帧用**会话级单个 `time.Ticker`** 推送，而非每帧 `time.After(frameDur)`。
 
-- **为什么要步调：** 一次将整个响应转储到浏览器会溢出其抖动缓冲区。我们以实时速率供应音频（镜像参考 `proxy.py`）。
-- **为什么是 Ticker 而不是 `time.After`：** `time.After` 在编码 + `WriteSample` 工作**后**启动其 20ms，所以每帧的实际周期是 `20ms + 编码`。那比实时慢，所以缓冲区备份，端到端延迟随响应长度单调增长。Ticker 在固定壁钟上触发；编码时间被吸收到 20ms 中而不是添加在顶部 → 零漂移。
-- **沉默处理：** 当 `Recv` 阻止提供商沉默时 Ticker 继续触发，但其大小 1 通道合并额外滴答 — 所以恢复语音**不**突发一堆帧。
+- **为什么要节拍控制：** 一次性把整段响应灌给浏览器会撑爆抖动缓冲区。我们按实时速率供音频（对齐参考实现 `proxy.py`）。
+- **为什么用 Ticker 而非 `time.After`：** `time.After` 的 20ms 在编码 + `WriteSample` **之后**才开始计时，每帧实际周期是 `20ms + 编码耗时`，慢于实时，缓冲区积压，端到端延迟随响应长度单调增长。Ticker 按固定墙钟触发，编码时间被吸收在 20ms 窗口内而非叠加其上 → 零漂移。
+- **沉默处理：** `Recv` 因提供商沉默而阻塞时 Ticker 仍触发，但 size-1 通道会合并多余 tick——恢复语音时**不会**突发积压帧。
 
-### 4.2 原子速率限制 + 失败开放
+### 4.2 原子速率限制 + 故障时放行
 
-- **通过 Lua 脚本的原子 `INCR+EXPIRE`。** 单独 `INCR` 然后 `EXPIRE` 有崩溃窗口：在两者之间死亡使键没有** TTL，所以计数器从不重置，IP **永远被锁定。Lua 脚本使两者成为一个原子步骤。
-- **Redis 错误时失败开放。** 速率限制是控制平面上的软卫兵；Redis 故障不应取下实时服务。出错时 `Allow` 返回 `true` 并仅表面日志错误。
+- **Lua 脚本实现原子 `INCR+EXPIRE`。** 分开执行 `INCR` 再 `EXPIRE` 有崩溃窗口：进程死在两者之间时键**没有 TTL**，计数器永不重置，该 IP **永久被封**。Lua 把两步合成原子操作。
+- **Redis 错误时故障放行。** 速率限制是控制平面上的软守卫；Redis 抖动不应拖垮实时服务。出错时 `Allow` 返回 `true`，仅记录日志。
 
-### 4.3 Redis 严格保持在控制平面
+### 4.3 Redis 严格限于控制平面
 
-Redis **仅**触及 SDP offer 端点（会话创建率）。媒体路径（Opus ↔ PCM ↔ 提供商）从不进行网络往返到 Redis — 通过 Redis 路由 20ms 音频帧会添加延迟并违反实时代理的点。这是不变量，不是事故。
+Redis **只**接触 SDP offer 端点（会话创建速率）。媒体路径（Opus ↔ PCM ↔ 提供商）从不向 Redis 发网络请求——让 20ms 音频帧绕道 Redis 会增加延迟，也违背实时代理的设计初衷。这是不变量，不是偶然。
 
 ### 4.4 共享 pion API / MediaEngine
 
-`Hub` 构建 pion `API`（带 Opus 调优 `MediaEngine` + 默认拦截器）**一次**并为每个对等连接重用，而不是重建每个会话的编解码器/拦截器状态。
+`Hub` **一次**构建 pion `API`（带 Opus 调优的 `MediaEngine` + 默认拦截器），每个对等连接复用，而非每会话重建编解码器/拦截器状态。
 
-### 4.5 Opus 调优用于有损/安静链接
+### 4.5 有损链路上的 Opus 调优
 
-Opus 调优两次 — 每个方向一次 — 用于实时语音在有损链接上。两侧为复原力和带宽交易一点保真度。
+两个方向各调一次 Opus，适配有损链路上的实时语音。两侧都以少量保真度换取韧性和带宽。
 
-**浏览器 → 代理（麦克风上行）。** 答案 SDP 在注册的 Opus 编解码器上公布这个 fmtp：
+**浏览器 → 代理（麦克风上行）。** Answer SDP 在注册的 Opus 编解码器上公布如下 fmtp：
 
 `minptime=10;useinbandfec=1;usedtx=1;maxaveragebitrate=16000`
 
-| fmtp 字段 | 效果 |
+| fmtp 字段 | 作用 |
 |---|---|
-| `minptime=10` | 允许 10ms 帧 — 降低首数据包 / 短话语延迟。 |
-| `useinbandfec=1` | 带外 FEC：从丢失后的后续数据包恢复部分音频。 |
-| `usedtx=1` | DTX：在沉默期间抑制完整帧 — 节省带宽和抖动缓冲区压力。 |
-| `maxaveragebitrate=16000` | 上限平均比特率 ~16 kbps — 窄带语音足以用于 LLM 对话。 |
+| `minptime=10` | 允许 10ms 帧，降低首包 / 短句延迟。 |
+| `useinbandfec=1` | 带内 FEC：丢包后从后续包恢复部分音频。 |
+| `usedtx=1` | DTX：沉默期抑制完整帧，省带宽、减抖动缓冲压力。 |
+| `maxaveragebitrate=16000` | 平均码率上限约 16 kbps，窄带语音足够 LLM 对话。 |
 
-代理用**单声道**解码器（`audio/opus.go`）解码；SDP 中的立体声是正常 WebRTC 协商，自动混为单声道。
+代理用**单声道**解码器（`audio/opus.go`）；SDP 中的立体声是正常 WebRTC 协商，会自动下混为单声道。
 
-**代理 → 浏览器（模型下行）。** `writeOutbound` 通过 `audio.NewEncoder` 编码：`AppVoIP`、带外 FEC + DTX 和 `PacketLossPerc=10`（实际上在编码器侧激活 FEC 的 — 仅 fmtp 不够）。帧是 20ms / 960 样本 @ 48kHz，由 §4.1 Ticker 步调。
+**代理 → 浏览器（模型下行）。** `writeOutbound` 经 `audio.NewEncoder` 编码：`AppVoIP`、带内 FEC + DTX、`PacketLossPerc=10`（编码器侧真正启用 FEC 所必需——仅靠 fmtp 不够）。帧长 20ms / 960 样本 @ 48kHz，由 §4.1 的 Ticker 推送。
 
-### 4.6 非涓流 ICE，仅主机候选
+### 4.6 非 Trickle ICE，仅 Host 候选
 
-`Serve` 等待 `GatheringCompletePromise` 并返回**完整** answer SDP 与候选（非涓流）。无 STUN/TURN/SFU（`iceServers=[]`）。代理是有意**不是** NAT 穿透基础设施 — 更简单的信令、更少的活动部件。权衡：媒体不会穿过集群 NAT；水平扩展和故障转移按设计部分（L1–L4 — 见 README 的"缩放与故障转移"）。在浏览器可直接到达的主机上运行容器。
+`Serve` 等待 `GatheringCompletePromise`，返回带候选的**完整** answer SDP（非 trickle）。无 STUN/TURN/SFU（`iceServers=[]`）。代理**刻意不做** NAT 穿透基础设施——信令更简单、组件更少。代价：媒体无法穿越集群 NAT；水平扩展与故障转移按设计是部分的（L1–L4，见 README「缩放与故障转移」）。请在浏览器能直连的主机上跑容器。
 
-### 4.7 整数比率的线性重采样
+### 4.7 整数倍采样率的线性重采样
 
-我们使用线性插值。在我们的整数比率（48k↔16k、24k→48k）处输出长度正确，每块边界对齐，所以文物最小 — 对语音足够好。如果质量重要，交换多相滤波器。
+使用线性插值。在整数倍率（48k↔16k、24k→48k）下输出长度精确、块边界对齐，伪影极小——对语音足够。若日后对质量有更高要求，可换多相滤波器。
 
 ### 4.8 生命周期与背压
 
-- **幂等撤销：** `session.cleanup` 在 `sync.Once` 下运行；连接状态变化、模型 EOF 和 hub 关闭都通过它安全漏斗。
-- **优雅关闭：** `Hub` 追踪直播会话；SIGINT/SIGTERM 调用 `CloseAll`，再然后 HTTP 服务器关闭。
-- **RTCP 排空：** goroutine 读取发送方的 RTCP，所以发送缓冲区不填充并阻止出站轨道。
-- **会话超过请求：** 模型连接 + `Serve` 使用背景上下文，所以媒体会话未绑定到 SDP HTTP 请求的生命周期。
+- **幂等清理：** `session.cleanup` 在 `sync.Once` 下执行；连接状态变化、模型 EOF、Hub 关闭都经它安全收敛。
+- **优雅关闭：** `Hub` 跟踪活跃会话；SIGINT/SIGTERM 先 `CloseAll`，再关闭 HTTP 服务器。
+- **RTCP 排空：** 独立 goroutine 读取发送方 RTCP，避免发送缓冲区填满而阻塞出站轨道。
+- **会话长于请求：** 模型连接 + `Serve` 使用后台 context，媒体会话不绑定 SDP HTTP 请求的生命周期。
 
-### 4.9 重连重放策略（最佳努力、有界）
+### 4.9 重连重放策略（尽力而为、有界）
 
-- **协议：** 重连使用 `X-Replay-Version: 1`、`X-Session-ID`、`X-Last-Seq`；服务器用 `X-Replay-Status` 回复。
-- **解析：** `offer.ResolveReplay` 验证头并首先尝试内存存档，然后可选重放索引（`-replay-url`）。
-- **严格但非阻止：** 格式错误的 `X-Last-Seq` / 不支持的重放版本返回 `400`；缺失 id/seq 简单回退到新会话。
-- **提供商范围：** 仅当重连提供商与原始会话/提供商匹配时重放，以避免跨模型转录污染。
-- **源顺序：** 内存存档首先（同节点），重放索引 HTTP 第二；硬预算（`-replay-timeout`、默认 `300ms`）和有界行（`-replay-limit`、默认 `100`）。
-- **Seq 不变量：** `transcript.Recorder` 分配 seq 一次；侧通道 `Tap` 和数据通道 JSON 都重用该 seq（无独立计数器）。
-- **不变量保留：** 重放是控制平面最佳努力；超时/错误永不阻止媒体启动，当 `-replay-url` 为空时跨节点重放被禁用。
+- **协议：** 重连使用 `X-Replay-Version: 1`、`X-Session-ID`、`X-Last-Seq`；服务器回复 `X-Replay-Status`。
+- **解析：** `offer.ResolveReplay` 校验头，先查内存存档，再查可选重放索引（`-replay-url`）。
+- **严格但不阻塞：** 格式错误的 `X-Last-Seq` / 不支持的重放版本 → `400`；缺失 id/seq 则回退为新会话。
+- **按提供商隔离：** 仅当重连提供商与原始会话一致时才重放，避免跨模型污染转录。
+- **数据源顺序：** 同节点内存存档优先，重放索引 HTTP 次之；硬预算（`-replay-timeout`，默认 `300ms`）与行数上限（`-replay-limit`，默认 `100`）。
+- **Seq 不变量：** `transcript.Recorder` 只分配一次 seq；侧通道 `Tap` 与数据通道 JSON 复用同一 seq（无独立计数器）。
+- **不变量保持：** 重放是控制平面尽力而为；超时/错误永不阻塞媒体启动；`-replay-url` 为空时跨节点重放禁用。
 
 ### 4.10 提供商守卫
 
-- **范围：** 阻止 offer 路径上的**新**拨号（`Models.New` 前的 `AllowDial`）。建立的媒体会话一旦连接不受影响。
-- **策略：** 当断路器打开/半开门控时用 `503` 失败，加上 `Retry-After`、`X-Model-CB-State`、`X-Model-CB-Reason`。
-- **状态机：** `closed -> open -> half_open -> closed`；半开每个提供商一次允许单个探针请求。
-- **错误敏感性：** 认证类拨号失败（`401/403`、未授权/禁止）立即打开，带更长的持有（`-model-cb-auth-open-for`、默认 5m）。非认证拨号失败在 `-model-cb-open-after` 连续拨号缺失后打开。
-- **恢复：** 成功拨号（`RecordDial(nil)`）为该提供商重置拨号和早期流故障条纹。
-- **早期流故障：** 如果提供商 WebSocket 连接但 `Recv` 在 `modelcb.EarlyFaultWindow`（10s）内任何音频前出错，`writeOutbound` 通过 `StreamFaultAt` → `RecordStreamFault` 报告 — 捕获"连接但到达时已死"。早期流故障单独从拨号故障计数。
-- **隔离：** 断路器按提供商，带可选按提供商覆盖。Loopback 和 nil 管理器跳过所有守卫逻辑。
+- **范围：** 在 offer 路径拦截**新**拨号（`Models.New` 前的 `AllowDial`）。已建立的媒体会话连接后不受影响。
+- **策略：** 断路器打开/半开受限时返回 `503`，附带 `Retry-After`、`X-Model-CB-State`、`X-Model-CB-Reason`。
+- **状态机：** `closed → open → half_open → closed`；半开时每个提供商同时只允许一次探测请求。
+- **错误敏感度：** 认证类拨号失败（`401/403`、unauthorized/forbidden）立即打开，较长保持（`-model-cb-auth-open-for`，默认 5m）。非认证拨号失败在 `-model-cb-open-after` 次连续失败后打开。
+- **恢复：** 拨号成功（`RecordDial(nil)`）会重置该提供商的拨号与早期流故障计数。
+- **早期流故障：** 提供商 WebSocket 已连接，但 `Recv` 在 `modelcb.EarlyFaultWindow`（10s）内、首帧音频前就出错时，`writeOutbound` 经 `StreamFaultAt` → `RecordStreamFault` 上报——捕获「连上了但一用就死」。早期流故障与拨号失败分开计数。
+- **隔离：** 断路器按提供商隔离，支持按提供商覆盖。Loopback 和 nil 管理器跳过全部守卫逻辑。
 
 ### 4.11 自适应 Opus 复杂度
 
-编码 CPU 支配每会话成本（~161µs/帧在默认复杂度）。原子复杂度值在每个编码处重读；控制器离媒体路径运行，仅可误选质量，永不阻止会话。
+编码 CPU 占每会话成本大头（默认复杂度约 161µs/帧）。原子复杂度值每次编码重读；控制器在媒体路径外运行，最多选错质量档位，不会阻塞会话。
 
-- **`sessions`（推荐）：** 活会话计数的前摄步函数，带滞后 — 在步调滑动前释放 CPU，无反馈循环。
-- **`drift`（实验性）：** 在 ≥30ms 晚帧分数上反应性；追踪真实 SLO 但在持续负载下可能振荡（与还原共享计时轮的相同风险）。
+- **`sessions`（推荐）：** 按活跃会话数的 proactive 阶梯函数，带滞后——在节拍打滑前释放 CPU，无反馈环路。
+- **`drift`（实验性）：** 对 ≥30ms 晚帧比例做反应式调节；贴近真实 SLO，但持续负载下可能振荡（与已回退的共享 timing wheel 同类风险）。
 
 ---
 
 ## 5. 测试
 
-- `internal/model/gemini`、`internal/model/doubao` — 音频 + 转录解码。
-- `internal/model/cascade` — 转折编排、抢断、推测部分、LLM 拦截接缝、输出混合接缝（使用 `fakestage/` 存根）。
-- `internal/offer` — 会话 offer 摄入（速率限制、守卫、模型生命周期）和重连重放解析（表驱动）。
-- `internal/modelcb` — 提供商守卫拨号 + 早期流故障策略。
-- `internal/transcript`、`internal/rtc` — 记录器 seq + 监听器通知。
-- `internal/ratelimit` — 最大拒绝、窗口重置（TTL 被设置）、Redis 不可达时失败开放、禁用限制器通过（使用 miniredis）。
-- `internal/replayindex`、`internal/sidechannel` — 重放索引客户端 + 存储。
-- `docs/bench/` — Opus 微基准基线和容量扫描（见 [`docs/bench/README.md`](bench/README.md)）。
+- `internal/model/gemini`、`internal/model/doubao` — 音频与转录解码。
+- `internal/model/cascade` — 话轮编排、插话打断、预判式部分结果、LLM 拦截接缝、输出混音接缝（`fakestage/` 存根）。
+- `internal/offer` — 会话 offer 摄入（速率限制、守卫、模型生命周期）与重连重放解析（表驱动）。
+- `internal/modelcb` — 提供商守卫拨号与早期流故障策略。
+- `internal/transcript`、`internal/rtc` — 记录器 seq 与监听器通知。
+- `internal/ratelimit` — 触顶拒绝、窗口重置（TTL 已设置）、Redis 不可达时故障放行、禁用限流器直通（miniredis）。
+- `internal/replayindex`、`internal/sidechannel` — 重放索引客户端与存储。
+- `docs/bench/` — Opus 微基准与容量扫描（见 [`docs/bench/README.md`](bench/README.md)）。
 
 ---
 
 ## 相关文档
 
-- [快速开始](QUICK_START.md) — 5 分钟设置
+- [快速开始](QUICK_START.md) — 5 分钟上手
 - [部署指南](DEPLOYMENT.md) — 完整部署手册
 - [中文指南](中文指南.md) — 中文概览
-
