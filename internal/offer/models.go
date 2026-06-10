@@ -32,10 +32,10 @@ type ProdModelFactory struct {
 	Cascade CascadeConfig
 }
 
-func (f ProdModelFactory) New(ctx context.Context, provider string) (model.Model, error) {
+func (f ProdModelFactory) New(ctx context.Context, provider string, history []model.RestoredTurn) (model.Model, error) {
 	switch provider {
 	case "doubao":
-		return doubao.New(ctx)
+		return doubao.NewWithHistory(ctx, history)
 	case "loopback":
 		return loopback.New(), nil
 	case "cascade":

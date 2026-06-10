@@ -13,6 +13,23 @@ type Transcript struct {
 	Text string
 }
 
+// RestoredTurn is one prior conversation turn replayed into a model on
+// reconnect. Role is "user" or "model".
+type RestoredTurn struct {
+	Role string
+	Text string
+}
+
+// ContextRestorer is an optional Model capability: providers that can be seeded
+// with prior conversation turns implement RestoreContext. On reconnect the
+// Bridge type-asserts to this and calls it with the restored transcript before
+// the session goes live, so the model resumes with dialogue context instead of
+// starting amnesiac. Providers that cannot accept injected context — e.g. a pure
+// speech-to-speech model with no text-in path — simply do not implement it.
+type ContextRestorer interface {
+	RestoreContext(turns []RestoredTurn) error
+}
+
 // Transcriber is an optional Model capability: providers that surface STT
 // implement RecvTranscript. The Bridge type-asserts to this to forward
 // transcripts to the browser data channel.

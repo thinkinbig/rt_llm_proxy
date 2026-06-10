@@ -120,6 +120,12 @@ type Gemini struct {
 	interruptedCh chan struct{} // Signals user speech interruption from server
 }
 
+var (
+	_ model.Model           = (*Gemini)(nil)
+	_ model.Transcriber     = (*Gemini)(nil)
+	_ model.ContextRestorer = (*Gemini)(nil)
+)
+
 func New(ctx context.Context) (*Gemini, error) {
 	// VAD enabled by default; set VAD_ENABLED=false to disable
 	enabled := os.Getenv("VAD_ENABLED") != "false"
@@ -214,6 +220,43 @@ func (g *Gemini) SendText(text string) error {
 		Text string `json:"text"`
 	}{{Text: text}}
 	return g.writeJSON(msg)
+}
+
+// RestoreContext implements model.ContextRestorer. On reconnect it replays the
+// prior conversation into the Live session as clientContent turns with
+// turnComplete=false, so the model regains dialogue context without being
+// prompted to generate a reply — the resumed live audio drives the next turn.
+func (g *Gemini) RestoreContext(turns []model.RestoredTurn) error {
+	if len(turns) == 0 {
+		return nil
+	}
+	return g.writeJSON(restoreClientContent(turns))
+}
+
+// restoreClientContent builds the clientContent message that replays prior turns
+// into the Live session. TurnComplete is false so the seeded history does not
+// trigger a model reply; roles other than "model" map to "user".
+func restoreClientContent(turns []model.RestoredTurn) geminiClientContent {
+	var msg geminiClientContent
+	msg.ClientContent.TurnComplete = false
+	for _, t := range turns {
+		role := "user"
+		if t.Role == "model" {
+			role = "model"
+		}
+		msg.ClientContent.Turns = append(msg.ClientContent.Turns, struct {
+			Role  string `json:"role"`
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		}{
+			Role: role,
+			Parts: []struct {
+				Text string `json:"text"`
+			}{{Text: t.Text}},
+		})
+	}
+	return msg
 }
 
 func (g *Gemini) Recv() ([]int16, error) {

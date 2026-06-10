@@ -80,6 +80,24 @@ func TestResumeOwnershipAndExpiry(t *testing.T) {
 	})
 }
 
+func TestRestoredTurnsMapping(t *testing.T) {
+	lines := []transcript.Line{
+		{Seq: 1, Role: "user", Text: "hi"},
+		{Seq: 2, Role: "model", Text: "hello"},
+	}
+	turns := restoredTurns(lines)
+	if len(turns) != 2 {
+		t.Fatalf("turns = %d, want 2", len(turns))
+	}
+	if turns[0].Role != "user" || turns[0].Text != "hi" ||
+		turns[1].Role != "model" || turns[1].Text != "hello" {
+		t.Fatalf("turns = %+v", turns)
+	}
+	if got := restoredTurns(nil); len(got) != 0 {
+		t.Fatalf("nil lines -> %+v, want empty", got)
+	}
+}
+
 func TestSessionRecordNotifiesListener(t *testing.T) {
 	var got []transcript.Line
 	l := listenerFunc(func(_ transcript.SessionMeta, line transcript.Line) {

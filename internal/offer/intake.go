@@ -11,6 +11,7 @@ import (
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/auth"
 	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 	"github.com/thinkinbig/rt-llm-proxy/internal/modelcb"
 	"github.com/thinkinbig/rt-llm-proxy/internal/ratelimit"
 	"github.com/thinkinbig/rt-llm-proxy/internal/rtc"
@@ -80,29 +81,6 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 		return IntakeResult{Status: 400, Body: "unknown model"}
 	}
 
-	now := time.Now()
-	if d := in.Guard.AllowDial(provider, now); !d.Allowed {
-		return circuitReject(d)
-	}
-
-	m, err := in.Models.New(modelCtx, provider)
-	in.Guard.RecordDial(provider, err, now)
-	if err != nil {
-		log.Printf("model connect: %v", err)
-		return IntakeResult{Status: 502, Body: err.Error()}
-	}
-
-	// served tracks whether m's ownership has left this function. It flips true
-	// the moment Serve is called: Serve owns m from then on (closes it on error,
-	// keeps it on success), so we must not also close it here — that would be a
-	// double Close. Until then, any early return owns m and must release it.
-	served := false
-	defer func() {
-		if !served {
-			m.Close()
-		}
-	}()
-
 	newSessionID := identity.SessionID(uuid.NewString())
 
 	headers, err := ParseReplayHeaders(
@@ -116,6 +94,17 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 		}
 	}
 
+	now := time.Now()
+	if d := in.Guard.AllowDial(provider, now); !d.Allowed {
+		return circuitReject(d)
+	}
+
+	// Resolve reconnect replay before dialing the model: the restored history
+	// must be available at construction for adapters that seed dialogue context
+	// at session start (doubao's dialog_context). ResolveReplay does not touch
+	// the model, so it can run first; a memory_hit takes over the old live
+	// session, but that session's transcript is archived on cleanup, so a failed
+	// dial below loses no history (the client can restore from the archive).
 	replay, err := ResolveReplay(
 		ctx,
 		provider,
@@ -132,6 +121,24 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 			return replayProtocolReject(pe.Message)
 		}
 	}
+
+	m, err := in.Models.New(modelCtx, provider, restoredTurns(replay.InitialHistory))
+	in.Guard.RecordDial(provider, err, now)
+	if err != nil {
+		log.Printf("model connect: %v", err)
+		return IntakeResult{Status: 502, Body: err.Error()}
+	}
+
+	// served tracks whether m's ownership has left this function. It flips true
+	// the moment Serve is called: Serve owns m from then on (closes it on error,
+	// keeps it on success), so we must not also close it here — that would be a
+	// double Close. Until then, any early return owns m and must release it.
+	served := false
+	defer func() {
+		if !served {
+			m.Close()
+		}
+	}()
 
 	sessionMeta := transcript.SessionMeta{
 		SessionID: replay.SessionID,
@@ -165,6 +172,19 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 		},
 		Body: answer,
 	}
+}
+
+// restoredTurns maps reconnect-restored transcript lines to the provider-agnostic
+// turns a ModelFactory threads into construction (doubao's dialog_context).
+func restoredTurns(lines []transcript.Line) []model.RestoredTurn {
+	if len(lines) == 0 {
+		return nil
+	}
+	turns := make([]model.RestoredTurn, 0, len(lines))
+	for _, l := range lines {
+		turns = append(turns, model.RestoredTurn{Role: l.Role, Text: l.Text})
+	}
+	return turns
 }
 
 func streamFaultBinder(guard *modelcb.Manager, provider string) func(time.Time) func(bool, error) {

@@ -7,9 +7,12 @@ import (
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 )
 
-// ModelFactory constructs a provider Model for an offer request.
+// ModelFactory constructs a provider Model for an offer request. history carries
+// the reconnect-restored conversation; adapters that seed context at session
+// construction (e.g. doubao's dialog_context) consume it, while adapters that
+// restore post-hoc via model.ContextRestorer ignore it (nil for fresh sessions).
 type ModelFactory interface {
-	New(ctx context.Context, provider string) (model.Model, error)
+	New(ctx context.Context, provider string, history []model.RestoredTurn) (model.Model, error)
 }
 
 // ParseProvider normalizes ?model= query values.

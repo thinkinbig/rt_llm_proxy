@@ -322,19 +322,24 @@ so `hostNetwork`/`replicas: N` don't make media work; that needs a TURN relay.
 |---|---|---|
 | L1 | server dies → client reconnects, service stays up | reachable once replicated behind TURN |
 | L2 | reconnect restores the *session* | **basic implementation** — demo client sends `X-Session-ID` + `X-Last-Seq`; proxy resumes same-node session and reuses the session id |
-| L3 | reconnect resumes *progress* | **partial** — same-node replay is in-memory; cross-node replay uses the replay-index service (`-replay-url`) |
-| L4 | near-seamless connection migration | impractical (fd/media affinity) — don't chase it |
+| L3 | reconnect resumes *progress* | **implemented** — same-node replay is in-memory, cross-node replay uses the replay-index service (`-replay-url`), and the model is re-seeded with restored context: cascade + gemini via the post-hoc `ContextRestorer` seam, doubao via `dialog.dialog_context` threaded into session construction |
+| L4 | near-seamless connection migration | out of scope — fd/media affinity makes it impractical; see [ADR 0001](docs/adr/0001-l4-connection-migration-impractical.md) |
 
 So it's **not "can't be done"** — the design already leans the right way: the
 proxy is thin (state behind the `Model` seam), key events are externalized to a
 replayable Kafka log keyed by `user_id` with a monotonic `seq`, and `session_id`
 is server-minted. With `-replay-url` set, the proxy queries the replay-index
 service for events after `last_seq`.
-The hard caveat:
-the *provider's* dialogue context (Gemini/Doubao upstream sockets, cascade
-LLM history on the GPU host) lives outside the replay log, so we can restore
-session metadata and transcribed text, but cannot guarantee the model resumes
-mid-thought.
+On reconnect the proxy re-seeds the freshly-dialed model with the restored
+transcript, so the model resumes *informed* of the prior conversation rather
+than amnesiac. Two injection points by provider lifecycle: cascade and gemini
+restore mid-session via the post-hoc `model.ContextRestorer` seam (cascade owns
+its history; gemini replays multi-turn `clientContent`); doubao takes context
+only at session start, so its history is threaded into construction as
+`dialog.dialog_context` (this is why `ResolveReplay` runs before the model is
+dialed). The hard caveat:
+this restores *transcript text*, not the provider's internal generation state,
+so we cannot guarantee the model resumes mid-thought.
 
 Reconnect protocol notes:
 

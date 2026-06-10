@@ -54,6 +54,7 @@ type Cascade struct {
 	transcriptCh chan model.Transcript // user + model text -> RecvTranscript()
 	textIn       chan string           // SendText -> orchestrator (typed user turn)
 	modelTurnCh  chan string           // respond() -> run(): completed model reply to append
+	restoreCh    chan []Message        // RestoreContext -> run(): prior turns to seed on reconnect
 
 	history []Message // touched only by the run() goroutine; no lock needed
 
@@ -94,8 +95,9 @@ type Cascade struct {
 }
 
 var (
-	_ model.Model       = (*Cascade)(nil)
-	_ model.Transcriber = (*Cascade)(nil)
+	_ model.Model           = (*Cascade)(nil)
+	_ model.Transcriber     = (*Cascade)(nil)
+	_ model.ContextRestorer = (*Cascade)(nil)
 )
 
 func New(ctx context.Context, cfg Config) (*Cascade, error) {
@@ -116,6 +118,7 @@ func New(ctx context.Context, cfg Config) (*Cascade, error) {
 		transcriptCh: make(chan model.Transcript, 64),
 		textIn:       make(chan string, 8),
 		modelTurnCh:  make(chan string, 8),
+		restoreCh:    make(chan []Message, 1),
 		pendingCh:    make(chan struct{}, 1),
 	}
 	if cfg.System != "" {
@@ -133,6 +136,34 @@ func (c *Cascade) SendAudio(pcm []int16) error { return c.asr.Write(pcm) }
 func (c *Cascade) SendText(text string) error {
 	select {
 	case c.textIn <- text:
+		return nil
+	case <-c.ctx.Done():
+		return io.EOF
+	}
+}
+
+// RestoreContext implements model.ContextRestorer: on reconnect it seeds prior
+// conversation turns into history so the LLM resumes with dialogue context
+// instead of starting amnesiac. Only "user" and "model" turns are kept (New
+// already seeds the system prompt). The turns are handed to run(), which owns
+// history, and are appended after any system prompt and before the first live
+// turn. Must be called before live dialogue begins.
+func (c *Cascade) RestoreContext(turns []model.RestoredTurn) error {
+	if len(turns) == 0 {
+		return nil
+	}
+	msgs := make([]Message, 0, len(turns))
+	for _, t := range turns {
+		if t.Role != "user" && t.Role != "model" {
+			continue
+		}
+		msgs = append(msgs, Message{Role: t.Role, Text: t.Text})
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	select {
+	case c.restoreCh <- msgs:
 		return nil
 	case <-c.ctx.Done():
 		return io.EOF

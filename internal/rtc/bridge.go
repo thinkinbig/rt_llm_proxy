@@ -290,6 +290,17 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 			info.Transcript,
 		),
 	}
+	// Reconnect: seed the freshly-dialed model with the restored conversation so
+	// it resumes with dialogue context instead of amnesia. Best-effort and
+	// provider-dependent — models that can't accept injected context (pure
+	// speech-to-speech, e.g. doubao) don't implement ContextRestorer and are
+	// skipped. The proxy recorder is already seeded above via InitialHistory.
+	if r, ok := m.(model.ContextRestorer); ok && len(info.InitialHistory) > 0 {
+		if err := r.RestoreContext(restoredTurns(info.InitialHistory)); err != nil {
+			log.Printf("rtc: context restore: %v", err)
+		}
+	}
+
 	scope := newSessionScope(h, pc, m, sess)
 	defer scope.abortIfUncommitted()
 
@@ -531,4 +542,14 @@ func sendReplay(dc *webrtc.DataChannel, replay []transcript.Line) {
 func marshalLine(line transcript.Line) string {
 	b, _ := json.Marshal(line)
 	return string(b)
+}
+
+// restoredTurns maps recorded transcript lines to the provider-agnostic
+// RestoredTurn turns a model.ContextRestorer accepts on reconnect.
+func restoredTurns(lines []transcript.Line) []model.RestoredTurn {
+	turns := make([]model.RestoredTurn, 0, len(lines))
+	for _, l := range lines {
+		turns = append(turns, model.RestoredTurn{Role: l.Role, Text: l.Text})
+	}
+	return turns
 }

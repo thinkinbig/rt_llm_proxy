@@ -60,7 +60,14 @@ type Doubao struct {
 	modelBuf strings.Builder
 }
 
-func New(ctx context.Context) (*Doubao, error) {
+func New(ctx context.Context) (*Doubao, error) { return NewWithHistory(ctx, nil) }
+
+// NewWithHistory dials Doubao and, when history is non-empty, preseeds the
+// session's dialogue context via the StartSession dialog.dialog_context field
+// so the model resumes a reconnected conversation instead of starting amnesiac.
+// Doubao takes context only at StartSession (session start), which is why this
+// is a constructor parameter rather than the post-hoc model.ContextRestorer seam.
+func NewWithHistory(ctx context.Context, history []model.RestoredTurn) (*Doubao, error) {
 	appID := os.Getenv("DOUBAO_APP_ID")
 	token := os.Getenv("DOUBAO_ACCESS_TOKEN")
 	if appID == "" || token == "" {
@@ -95,8 +102,12 @@ func New(ctx context.Context) (*Doubao, error) {
 		d.Close()
 		return nil, fmt.Errorf("doubao: start connection: %w", err)
 	}
+	dialog := map[string]any{"bot_name": botName}
+	if dc := dialogContext(history); len(dc) > 0 {
+		dialog["dialog_context"] = dc
+	}
 	start := map[string]any{
-		"dialog": map[string]any{"bot_name": botName},
+		"dialog": dialog,
 		"tts":    map[string]any{"audio_config": map[string]any{"channel": 1, "format": "pcm", "sample_rate": doubaoOutRate}},
 	}
 	sb, _ := json.Marshal(start)
@@ -112,6 +123,23 @@ func New(ctx context.Context) (*Doubao, error) {
 	return d, nil
 }
 
+// dialogContext maps restored turns to Doubao's dialog_context shape. Doubao
+// names the model role "assistant" (not "model"); other roles map to "user".
+func dialogContext(history []model.RestoredTurn) []map[string]string {
+	if len(history) == 0 {
+		return nil
+	}
+	out := make([]map[string]string, 0, len(history))
+	for _, t := range history {
+		role := "user"
+		if t.Role == "model" {
+			role = "assistant"
+		}
+		out = append(out, map[string]string{"role": role, "text": t.Text})
+	}
+	return out
+}
+
 func (d *Doubao) writeFrame(msgType, serial byte, event int32, payload []byte) error {
 	frame := dbBuildFrame(msgType, serial, dbCompressGzip, event, d.sid, payload)
 	d.writeM.Lock()
@@ -125,7 +153,12 @@ func (d *Doubao) SendAudio(samples []int16) error {
 	return d.writeFrame(dbMsgAudioClient, dbSerialRaw, dbEvTaskRequest, gzipBytes(pcm.ToBytes(in)))
 }
 
-// SendText is a no-op: this is a voice-to-voice model with no text input path.
+// SendText is a no-op: this adapter drives Doubao as a voice-to-voice session
+// and does not use a text input path.
+//
+// Doubao does not implement the post-hoc model.ContextRestorer seam because it
+// takes dialogue context only at StartSession; reconnect context restore is
+// instead threaded into construction via NewWithHistory (dialog.dialog_context).
 func (d *Doubao) SendText(string) error { return nil }
 
 func (d *Doubao) Recv() ([]int16, error) {

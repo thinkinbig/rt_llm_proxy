@@ -28,6 +28,10 @@ func (c *Cascade) run() {
 			lastUserText = c.handleASR(ev, lastUserText)
 		case <-c.pendingCh:
 			c.startRespond()
+		case msgs := <-c.restoreCh:
+			// Reconnect: seed prior turns into history before live dialogue.
+			// Only run() mutates history, so the append happens here.
+			c.history = append(c.history, msgs...)
 		case text := <-c.textIn:
 			if jaccard(text, lastUserText) >= similarityThreshold {
 				continue // duplicate typed turn — ignore

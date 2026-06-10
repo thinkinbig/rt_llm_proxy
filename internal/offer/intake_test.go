@@ -35,10 +35,12 @@ type fakeFactory struct {
 	err             error
 	newN            int
 	lastCtxCanceled bool
+	lastHistory     []model.RestoredTurn
 }
 
-func (f *fakeFactory) New(ctx context.Context, _ string) (model.Model, error) {
+func (f *fakeFactory) New(ctx context.Context, _ string, history []model.RestoredTurn) (model.Model, error) {
 	f.newN++
+	f.lastHistory = history
 	if ctx != nil {
 		select {
 		case <-ctx.Done():
@@ -55,6 +57,10 @@ func (f *fakeFactory) New(ctx context.Context, _ string) (model.Model, error) {
 type fakeHub struct {
 	serveN int
 	err    error
+	// resume* configure a memory_hit on Resume (zero values = miss, the default).
+	resumeFull []transcript.Line
+	resumeSeq  uint64
+	resumeOK   bool
 }
 
 func (h *fakeHub) Serve(_ string, m model.Model, _ rtc.SessionInfo) (string, error) {
@@ -71,8 +77,17 @@ func (h *fakeHub) SessionState(identity.SessionID, identity.UserID) (string, uin
 	return "", 0, false
 }
 
-func (h *fakeHub) Resume(identity.SessionID, identity.UserID, string, uint64) ([]transcript.Line, []transcript.Line, uint64, bool) {
-	return nil, nil, 0, false
+func (h *fakeHub) Resume(_ identity.SessionID, _ identity.UserID, _ string, afterSeq uint64) ([]transcript.Line, []transcript.Line, uint64, bool) {
+	if !h.resumeOK {
+		return nil, nil, 0, false
+	}
+	var replay []transcript.Line
+	for _, l := range h.resumeFull {
+		if l.Seq > afterSeq {
+			replay = append(replay, l)
+		}
+	}
+	return h.resumeFull, replay, h.resumeSeq, true
 }
 
 func TestIntakeCircuitOpen(t *testing.T) {
@@ -125,10 +140,11 @@ func TestIntakeDialFailureClosesModel(t *testing.T) {
 
 func TestIntakeReplayProtocolInvalid(t *testing.T) {
 	fm := &fakeModel{}
+	factory := &fakeFactory{m: fm}
 	in := Intake{
 		Limiter: ratelimit.New("", 0, time.Minute),
 		Guard:   modelcb.New(modelcb.Config{}, nil),
-		Models:  &fakeFactory{m: fm},
+		Models:  factory,
 		Hub:     &fakeHub{},
 	}
 	res := in.ServeOffer(IntakeRequest{
@@ -143,8 +159,51 @@ func TestIntakeReplayProtocolInvalid(t *testing.T) {
 	if res.Status != 400 || res.Headers["X-Replay-Status"] != "protocol_invalid" {
 		t.Fatalf("got %+v", res)
 	}
-	if fm.closeCount != 1 {
-		t.Fatalf("model close count = %d want 1", fm.closeCount)
+	// Replay resolves before the model is dialed, so a protocol-invalid request
+	// is rejected without ever connecting a provider (no wasted dial / close).
+	if factory.newN != 0 {
+		t.Fatalf("new calls = %d want 0 (rejected before dial)", factory.newN)
+	}
+	if fm.closeCount != 0 {
+		t.Fatalf("model close count = %d want 0", fm.closeCount)
+	}
+}
+
+func TestIntakeReconnectThreadsHistoryToFactory(t *testing.T) {
+	hub := &fakeHub{
+		resumeOK:   true,
+		resumeSeq:  2,
+		resumeFull: []transcript.Line{{Seq: 1, Role: "user", Text: "hi"}, {Seq: 2, Role: "model", Text: "hello"}},
+	}
+	factory := &fakeFactory{m: &fakeModel{}}
+	in := Intake{
+		Limiter: ratelimit.New("", 0, time.Minute),
+		Guard:   modelcb.New(modelcb.Config{}, nil),
+		Models:  factory,
+		Hub:     hub,
+	}
+	res := in.ServeOffer(IntakeRequest{
+		Ctx:             context.Background(),
+		ClientIP:        "1.2.3.4",
+		Model:           "doubao",
+		OfferSDP:        []byte("sdp"),
+		UserID:          "alice", // non-anonymous: reconnect requires an owner
+		SessionIDHeader: "s1",
+		LastSeqHeader:   "1",
+	})
+	if res.Status != 200 || res.Headers["X-Replay-Status"] != "memory_hit" {
+		t.Fatalf("got %+v", res)
+	}
+	// The freshly-dialed model is constructed WITH the restored history so an
+	// adapter like doubao can seed dialog_context at session start.
+	want := []model.RestoredTurn{{Role: "user", Text: "hi"}, {Role: "model", Text: "hello"}}
+	if len(factory.lastHistory) != len(want) {
+		t.Fatalf("factory history = %+v, want %+v", factory.lastHistory, want)
+	}
+	for i := range want {
+		if factory.lastHistory[i] != want[i] {
+			t.Fatalf("history[%d] = %+v, want %+v", i, factory.lastHistory[i], want[i])
+		}
 	}
 }
 
