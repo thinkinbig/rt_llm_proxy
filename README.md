@@ -133,6 +133,16 @@ model. The demo ships a `get_weather` stub. (Doubao's direct protocol has no
 native function calling — only the RTC-room "混合编排" path does, which this proxy
 does not use.)
 
+**Per-session listener brief.** The offer request may carry an `X-Listener-Brief`
+header (base64 of UTF-8 text). It is appended to the provider's system prompt for
+that session only — injected as **system instruction**, never as a dialogue turn,
+so it cannot loop back into the transcript. Intended for an upstream orchestrator
+to inject per-user memory (e.g. "this listener likes Jay Chou, is studying"); the
+global persona stays in `proxy.yaml`, the per-user brief rides the header. Decoded
+best-effort (bad/oversize header → ignored), capped at 8 KiB. Note: the brief is
+trusted from the caller — in production the offer endpoint must be reachable only
+by the orchestrator, not browsers (currently it is not locked down).
+
 <a id="cascade"></a>
 
 ## Cascade pipeline (`?model=cascade`)

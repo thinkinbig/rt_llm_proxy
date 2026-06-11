@@ -61,6 +61,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		SessionIDHeader:     r.Header.Get("X-Session-ID"),
 		LastSeqHeader:       r.Header.Get("X-Last-Seq"),
 		ReplayVersionHeader: r.Header.Get("X-Replay-Version"),
+		ListenerBriefHeader: r.Header.Get("X-Listener-Brief"),
 	})
 	writeIntakeResult(w, res)
 }

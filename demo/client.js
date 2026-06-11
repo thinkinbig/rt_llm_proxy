@@ -301,6 +301,13 @@ async function start() {
       headers['X-Last-Seq'] = String(sessionState.lastSeq);
       headers['X-Replay-Version'] = '1';
     }
+    // DEV-ONLY: in production the orchestrator sets X-Listener-Brief server-side.
+    // For local testing, pass it via ?brief=... and we base64(UTF-8)-encode it.
+    const brief = new URLSearchParams(location.search).get('brief');
+    if (brief) {
+      headers['X-Listener-Brief'] = btoa(unescape(encodeURIComponent(brief)));
+      log('brief → ' + brief);
+    }
     const resp = await fetch(`/?model=${model}`, {
       method: 'POST',
       headers,

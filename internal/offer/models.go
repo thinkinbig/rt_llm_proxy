@@ -37,10 +37,12 @@ type ProdModelFactory struct {
 	Doubao  doubao.Config
 }
 
-func (f ProdModelFactory) New(ctx context.Context, provider string, history []model.RestoredTurn) (model.Model, error) {
+func (f ProdModelFactory) New(ctx context.Context, provider string, history []model.RestoredTurn, params model.SessionParams) (model.Model, error) {
 	switch provider {
 	case "doubao":
-		return doubao.NewWithConfig(ctx, f.Doubao, history)
+		cfg := f.Doubao
+		cfg.SystemRole = joinSystem(cfg.SystemRole, params.SystemSuffix)
+		return doubao.NewWithConfig(ctx, cfg, history)
 	case "loopback":
 		return loopback.New(), nil
 	case "cascade":
@@ -62,9 +64,24 @@ func (f ProdModelFactory) New(ctx context.Context, provider string, history []mo
 			LLM:        llm.New(f.Cascade.LLMURL, f.Cascade.LLMModel),
 			TTS:        ttsStage,
 			TurnDetect: td,
-			System:     f.Cascade.System,
+			System:     joinSystem(f.Cascade.System, params.SystemSuffix),
 		})
 	default:
-		return gemini.NewWithConfig(ctx, f.Gemini)
+		cfg := f.Gemini
+		cfg.SystemPrompt = joinSystem(cfg.SystemPrompt, params.SystemSuffix)
+		return gemini.NewWithConfig(ctx, cfg)
+	}
+}
+
+// joinSystem appends a per-session suffix to a base system prompt, separated by a
+// blank line. Either side may be empty.
+func joinSystem(base, suffix string) string {
+	switch {
+	case suffix == "":
+		return base
+	case base == "":
+		return suffix
+	default:
+		return base + "\n\n" + suffix
 	}
 }

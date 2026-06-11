@@ -22,6 +22,15 @@ type RestoredTurn struct {
 	Text string
 }
 
+// SessionParams carries per-session knobs supplied at construction, distinct
+// from the process-global provider config. SystemSuffix is appended to the
+// provider's system prompt for this session only (e.g. a per-user "listener
+// brief" from an upstream memory service); it is injected as system instruction,
+// never as a dialogue turn, so it cannot loop back into the transcript.
+type SessionParams struct {
+	SystemSuffix string
+}
+
 // ContextRestorer is an optional Model capability: providers that can be seeded
 // with prior conversation turns implement RestoreContext. On reconnect the
 // Bridge type-asserts to this and calls it with the restored transcript before
