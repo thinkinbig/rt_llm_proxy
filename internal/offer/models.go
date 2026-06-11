@@ -28,14 +28,19 @@ type CascadeConfig struct {
 }
 
 // ProdModelFactory connects real provider adapters for production wiring.
+// Gemini and Doubao carry per-deployment behavior (persona, voice, ASR tuning)
+// resolved at startup from flags and the config file; credentials still come
+// from the environment inside each adapter.
 type ProdModelFactory struct {
 	Cascade CascadeConfig
+	Gemini  gemini.Config
+	Doubao  doubao.Config
 }
 
 func (f ProdModelFactory) New(ctx context.Context, provider string, history []model.RestoredTurn) (model.Model, error) {
 	switch provider {
 	case "doubao":
-		return doubao.NewWithHistory(ctx, history)
+		return doubao.NewWithConfig(ctx, f.Doubao, history)
 	case "loopback":
 		return loopback.New(), nil
 	case "cascade":
@@ -60,6 +65,6 @@ func (f ProdModelFactory) New(ctx context.Context, provider string, history []mo
 			System:     f.Cascade.System,
 		})
 	default:
-		return gemini.New(ctx)
+		return gemini.NewWithConfig(ctx, f.Gemini)
 	}
 }

@@ -12,6 +12,7 @@ require (
 	github.com/redis/go-redis/v9 v9.20.0
 	github.com/twmb/franz-go v1.21.2
 	google.golang.org/protobuf v1.36.11
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

@@ -18,6 +18,8 @@ import (
 	"github.com/thinkinbig/rt-llm-proxy/internal/audio"
 	"github.com/thinkinbig/rt-llm-proxy/internal/auth"
 	"github.com/thinkinbig/rt-llm-proxy/internal/metrics"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/doubao"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/gemini"
 	"github.com/thinkinbig/rt-llm-proxy/internal/modelcb"
 	"github.com/thinkinbig/rt-llm-proxy/internal/offer"
 	"github.com/thinkinbig/rt-llm-proxy/internal/ratelimit"
@@ -67,6 +69,21 @@ func runProxy(cfg runConfig) error {
 				TTSLang:       cfg.CascadeTTSLang,
 				TurnDetectURL: cfg.CascadeTurnDetectURL,
 				System:        cfg.CascadeSystem,
+			},
+			Gemini: gemini.Config{
+				SystemPrompt: cfg.GeminiSystemPrompt,
+				VAD:          gemini.EnvVAD(), // VAD stays env-controlled (VAD_ENABLED)
+				Tools:        cfg.GeminiTools,
+			},
+			Doubao: doubao.Config{
+				ModelVersion:   cfg.DoubaoModelVersion,
+				BotName:        cfg.DoubaoBotName,
+				SystemRole:     cfg.DoubaoSystemRole,
+				SpeakingStyle:  cfg.DoubaoSpeakingStyle,
+				Voice:          cfg.DoubaoVoice,
+				ASRTwopass:     cfg.DoubaoASRTwopass,
+				ASREndSmoothMs: cfg.DoubaoASREndSmoothMs,
+				Hotwords:       cfg.DoubaoHotwords,
 			},
 		},
 		TrustProxy: cfg.TrustProxy,

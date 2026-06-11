@@ -5,6 +5,8 @@
 // native Opus rate). Each adapter resamples to/from its own wire format internally.
 package model
 
+import "encoding/json"
+
 // Transcript is one speech-to-text turn returned by a model that supports
 // transcription. Role is "user" or "model". Seq is assigned by the Bridge
 // recorder, not by the provider.
@@ -38,6 +40,34 @@ type Transcriber interface {
 	// RecvInterrupted checks if the model detected user speech interruption (barge-in).
 	// Returns (true, nil) if interrupted, (false, nil) if not, or (_, err) on error.
 	RecvInterrupted() (bool, error)
+}
+
+// ToolCall is a function-call request emitted by a model that supports tool use.
+// Args is the raw JSON arguments object the model produced.
+type ToolCall struct {
+	ID   string
+	Name string
+	Args json.RawMessage
+}
+
+// ToolResult is the outcome of executing a ToolCall, returned to the model.
+// Response is a JSON object the model consumes as the function's return value.
+type ToolResult struct {
+	ID       string
+	Name     string
+	Response json.RawMessage
+}
+
+// ToolDispatcher is an optional Model capability: providers that support
+// function calling implement it. The Bridge type-asserts to this and, when
+// present, forwards each tool call to the browser data channel and returns the
+// browser's result to the model. Providers without native tool calling (e.g.
+// the Doubao direct protocol) simply do not implement it.
+type ToolDispatcher interface {
+	// RecvToolCall blocks for the next tool call; returns io.EOF when closed.
+	RecvToolCall() (ToolCall, error)
+	// SendToolResult returns a function result to the model.
+	SendToolResult(ToolResult) error
 }
 
 type Model interface {

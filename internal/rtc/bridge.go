@@ -325,19 +325,36 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 		})
 	})
 
-	// Data channel: browser text -> model; model transcripts -> browser.
+	// Data channel: browser text/tool-results -> model; model transcripts/
+	// tool-calls -> browser.
 	var replayOnce sync.Once
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		td, hasTools := m.(model.ToolDispatcher)
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if msg.IsString {
-				sess.rec.Record("user", string(msg.Data))
-				_ = m.SendText(string(msg.Data))
+			if !msg.IsString {
+				return
 			}
+			// A tool-result envelope is routed to the model; anything else is
+			// treated as user text input.
+			if hasTools {
+				if res, ok := parseToolResult(msg.Data); ok {
+					_ = td.SendToolResult(res)
+					return
+				}
+			}
+			sess.rec.Record("user", string(msg.Data))
+			_ = m.SendText(string(msg.Data))
 		})
-		if t, ok := m.(model.Transcriber); ok {
+		t, hasTranscript := m.(model.Transcriber)
+		if hasTranscript || hasTools {
 			start := func() {
-				replayOnce.Do(func() { sendReplay(dc, info.Replay) })
-				h.wg.Go(func() { forwardTranscripts(scope.mediaCtx(), dc, t, sess) })
+				if hasTranscript {
+					replayOnce.Do(func() { sendReplay(dc, info.Replay) })
+					h.wg.Go(func() { forwardTranscripts(scope.mediaCtx(), dc, t, sess) })
+				}
+				if hasTools {
+					h.wg.Go(func() { forwardToolCalls(scope.mediaCtx(), dc, td) })
+				}
 			}
 			if dc.ReadyState() == webrtc.DataChannelStateOpen {
 				start()
@@ -542,6 +559,55 @@ func sendReplay(dc *webrtc.DataChannel, replay []transcript.Line) {
 func marshalLine(line transcript.Line) string {
 	b, _ := json.Marshal(line)
 	return string(b)
+}
+
+// toolCallEnvelope is the data-channel message carrying a model tool call to the
+// browser. The browser replies with a {"type":"tool_result",...} message.
+type toolCallEnvelope struct {
+	Type string          `json:"type"`
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
+}
+
+// forwardToolCalls relays model tool calls to the browser over the data channel,
+// where the application (e.g. the DJ) executes the function and replies. Exits
+// when the model closes (RecvToolCall errors) or the channel goes away.
+func forwardToolCalls(ctx context.Context, dc *webrtc.DataChannel, td model.ToolDispatcher) {
+	for {
+		call, err := td.RecvToolCall()
+		if err != nil {
+			return
+		}
+		env := toolCallEnvelope{Type: "tool_call", ID: call.ID, Name: call.Name, Args: call.Args}
+		b, _ := json.Marshal(env)
+		if dc.ReadyState() != webrtc.DataChannelStateOpen {
+			return
+		}
+		if err := dc.SendText(string(b)); err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+}
+
+// parseToolResult decodes a {"type":"tool_result",...} envelope the browser sends
+// back after running a tool. Returns false for any other message (plain user text).
+func parseToolResult(data []byte) (model.ToolResult, bool) {
+	var env struct {
+		Type     string          `json:"type"`
+		ID       string          `json:"id"`
+		Name     string          `json:"name"`
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil || env.Type != "tool_result" {
+		return model.ToolResult{}, false
+	}
+	return model.ToolResult{ID: env.ID, Name: env.Name, Response: env.Response}, true
 }
 
 // restoredTurns maps recorded transcript lines to the provider-agnostic

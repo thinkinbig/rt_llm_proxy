@@ -4,6 +4,7 @@ import (
 	"flag"
 	"time"
 
+	"github.com/thinkinbig/rt-llm-proxy/internal/model/gemini"
 	"github.com/thinkinbig/rt-llm-proxy/internal/modelcb"
 )
 
@@ -39,9 +40,26 @@ type runConfig struct {
 	CascadeTTSLang       string
 	CascadeTurnDetectURL string
 	CascadeSystem        string
+
+	// Provider behavior (config-file only; no CLI flags). Empty fields leave the
+	// provider's own defaults in place.
+	GeminiSystemPrompt   string
+	GeminiTools          []gemini.FunctionDeclaration
+	DoubaoModelVersion   string
+	DoubaoBotName        string
+	DoubaoSystemRole     string
+	DoubaoSpeakingStyle  string
+	DoubaoVoice          string
+	DoubaoASRTwopass     bool
+	DoubaoASREndSmoothMs int
+	DoubaoHotwords       []string
 }
 
-func parseFlags() runConfig {
+// parseFlags defines and parses CLI flags. It returns the assembled runConfig,
+// the set of flag names explicitly provided on the command line (so the config
+// file knows which fields it must not override), and the config file path.
+func parseFlags() (runConfig, map[string]bool, string) {
+	configPath := flag.String("config", "proxy.yaml", "config file path (skipped if absent)")
 	addr := flag.String("addr", ":8080", "listen address")
 	redisAddr := flag.String("redis", "", "redis address for rate limiting (empty = disabled)")
 	rlMax := flag.Int("rl-max", 10, "max sessions per client per window")
@@ -79,7 +97,7 @@ func parseFlags() runConfig {
 	cascadeSystem := flag.String("cascade-system", "You are a helpful voice assistant.", "system prompt for cascade LLM")
 	flag.Parse()
 
-	return runConfig{
+	cfg := runConfig{
 		Addr:            *addr,
 		AdminAddr:       *adminAddr,
 		RedisAddr:       *redisAddr,
@@ -122,4 +140,8 @@ func parseFlags() runConfig {
 		CascadeTurnDetectURL: *cascadeTurnDetectURL,
 		CascadeSystem:        *cascadeSystem,
 	}
+
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return cfg, set, *configPath
 }

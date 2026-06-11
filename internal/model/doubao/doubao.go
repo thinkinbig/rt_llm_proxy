@@ -44,38 +44,73 @@ type transcript struct {
 	Final bool
 }
 
+// Config holds session behavior for a Doubao connection. Credentials still come
+// from the environment (DOUBAO_APP_ID / DOUBAO_ACCESS_TOKEN); Config carries the
+// per-deployment persona, voice, and ASR tuning set from the proxy config file.
+// Zero values mean "leave the field off the StartSession payload" so Doubao keeps
+// its own defaults.
+type Config struct {
+	ModelVersion   string   // dialog.extra.model — REQUIRED ("1.2.1.1" O2.0 / "2.2.0.0" SC2.0); defaults to "1.2.1.1"
+	BotName        string   // dialog.bot_name (env DOUBAO_BOT_NAME or "豆包" if empty)
+	SystemRole     string   // dialog.system_role — identity/background (O series)
+	SpeakingStyle  string   // dialog.speaking_style — tone (O series)
+	Voice          string   // tts.speaker — voice id
+	ASRTwopass     bool     // asr.extra.enable_asr_twopass (paid; hotwords need it)
+	ASREndSmoothMs int      // asr.extra.end_smooth_window_ms — end-of-utterance pause
+	Hotwords       []string // asr.extra.context.hotwords — direct hotword list
+}
+
+// doubaoDefaultModel is the O2.0 version, used when Config.ModelVersion is empty.
+// The model field is required by the API, so we always send one.
+const doubaoDefaultModel = "1.2.1.1"
+
 type Doubao struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	conn         *websocket.Conn
-	writeM       sync.Mutex
-	wg           sync.WaitGroup // readLoop + keepAlive; Close waits on it
-	recvCh       chan []int16
-	transcriptCh chan transcript
-	sid          string
-	lastSend     atomic.Int64 // unix-nanos of last upstream audio, for keep-alive
+	ctx           context.Context
+	cancel        context.CancelFunc
+	conn          *websocket.Conn
+	writeM        sync.Mutex
+	wg            sync.WaitGroup // readLoop + keepAlive; Close waits on it
+	recvCh        chan []int16
+	transcriptCh  chan transcript
+	sid           string
+	lastSend      atomic.Int64  // unix-nanos of last upstream audio, for keep-alive
+	interruptedCh chan struct{} // server-VAD barge-in (event 450); buffered depth 1
 
 	// Model reply text streams as deltas; accumulate so each transcript carries
 	// the full sentence so far. Reset on ChatEnded. Touched only by readLoop.
 	modelBuf strings.Builder
 }
 
-func New(ctx context.Context) (*Doubao, error) { return NewWithHistory(ctx, nil) }
+func New(ctx context.Context) (*Doubao, error) { return NewWithConfig(ctx, Config{}, nil) }
 
-// NewWithHistory dials Doubao and, when history is non-empty, preseeds the
+// NewWithHistory dials Doubao seeding only reconnect history (no extra config).
+// Retained for callers that do not customize persona/voice; delegates to
+// NewWithConfig.
+func NewWithHistory(ctx context.Context, history []model.RestoredTurn) (*Doubao, error) {
+	return NewWithConfig(ctx, Config{}, history)
+}
+
+// NewWithConfig dials Doubao and, when history is non-empty, preseeds the
 // session's dialogue context via the StartSession dialog.dialog_context field
 // so the model resumes a reconnected conversation instead of starting amnesiac.
 // Doubao takes context only at StartSession (session start), which is why this
 // is a constructor parameter rather than the post-hoc model.ContextRestorer seam.
-func NewWithHistory(ctx context.Context, history []model.RestoredTurn) (*Doubao, error) {
+// cfg carries persona, voice, and ASR tuning; empty fields are left off the
+// payload so Doubao keeps its defaults.
+func NewWithConfig(ctx context.Context, cfg Config, history []model.RestoredTurn) (*Doubao, error) {
 	appID := os.Getenv("DOUBAO_APP_ID")
 	token := os.Getenv("DOUBAO_ACCESS_TOKEN")
 	if appID == "" || token == "" {
 		return nil, fmt.Errorf("doubao: set DOUBAO_APP_ID and DOUBAO_ACCESS_TOKEN")
 	}
-	botName := os.Getenv("DOUBAO_BOT_NAME")
-	if botName == "" {
-		botName = "豆包"
+	if cfg.BotName == "" {
+		cfg.BotName = os.Getenv("DOUBAO_BOT_NAME")
+	}
+	if cfg.BotName == "" {
+		cfg.BotName = "豆包"
+	}
+	if cfg.ModelVersion == "" {
+		cfg.ModelVersion = doubaoDefaultModel
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -96,21 +131,14 @@ func NewWithHistory(ctx context.Context, history []model.RestoredTurn) (*Doubao,
 	d := &Doubao{
 		ctx: cctx, cancel: cancel, conn: conn,
 		recvCh: make(chan []int16, 64), transcriptCh: make(chan transcript, 64), sid: newUUID(),
+		interruptedCh: make(chan struct{}, 1),
 	}
 
 	if err := d.writeFrame(dbMsgFullClient, dbSerialJSON, dbEvStartConnection, gzipBytes([]byte("{}"))); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("doubao: start connection: %w", err)
 	}
-	dialog := map[string]any{"bot_name": botName}
-	if dc := dialogContext(history); len(dc) > 0 {
-		dialog["dialog_context"] = dc
-	}
-	start := map[string]any{
-		"dialog": dialog,
-		"tts":    map[string]any{"audio_config": map[string]any{"channel": 1, "format": "pcm", "sample_rate": doubaoOutRate}},
-	}
-	sb, _ := json.Marshal(start)
+	sb, _ := json.Marshal(buildStartSession(cfg, history))
 	if err := d.writeFrame(dbMsgFullClient, dbSerialJSON, dbEvStartSession, gzipBytes(sb)); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("doubao: start session: %w", err)
@@ -121,6 +149,58 @@ func NewWithHistory(ctx context.Context, history []model.RestoredTurn) (*Doubao,
 	go d.readLoop()
 	go d.keepAlive()
 	return d, nil
+}
+
+// buildStartSession assembles the StartSession payload. Empty Config fields are
+// left off so Doubao keeps its own defaults; reconnect history seeds
+// dialog.dialog_context. BotName must already be resolved by the caller.
+func buildStartSession(cfg Config, history []model.RestoredTurn) map[string]any {
+	dialog := map[string]any{
+		"bot_name": cfg.BotName,
+		"extra":    map[string]any{"model": cfg.ModelVersion}, // required by the API
+	}
+	if cfg.SystemRole != "" {
+		dialog["system_role"] = cfg.SystemRole
+	}
+	if cfg.SpeakingStyle != "" {
+		dialog["speaking_style"] = cfg.SpeakingStyle
+	}
+	if dc := dialogContext(history); len(dc) > 0 {
+		dialog["dialog_context"] = dc
+	}
+	tts := map[string]any{"audio_config": map[string]any{"channel": 1, "format": "pcm", "sample_rate": doubaoOutRate}}
+	if cfg.Voice != "" {
+		tts["speaker"] = cfg.Voice
+	}
+	start := map[string]any{"dialog": dialog, "tts": tts}
+	if asr := buildASRExtra(cfg); asr != nil {
+		start["asr"] = asr
+	}
+	return start
+}
+
+// buildASRExtra builds the asr.extra block, or nil when nothing is configured.
+// Per Doubao docs hotwords only take effect when ASRTwopass is true; the operator
+// is responsible for enabling it alongside hotwords.
+func buildASRExtra(cfg Config) map[string]any {
+	extra := map[string]any{}
+	if cfg.ASRTwopass {
+		extra["enable_asr_twopass"] = true
+	}
+	if cfg.ASREndSmoothMs > 0 {
+		extra["end_smooth_window_ms"] = cfg.ASREndSmoothMs
+	}
+	if len(cfg.Hotwords) > 0 {
+		words := make([]map[string]string, len(cfg.Hotwords))
+		for i, w := range cfg.Hotwords {
+			words[i] = map[string]string{"word": w}
+		}
+		extra["context"] = map[string]any{"hotwords": words}
+	}
+	if len(extra) == 0 {
+		return nil
+	}
+	return map[string]any{"extra": extra}
 }
 
 // dialogContext maps restored turns to Doubao's dialog_context shape. Doubao
@@ -200,19 +280,47 @@ func (d *Doubao) RecvTranscript() (model.Transcript, error) {
 	}
 }
 
+// RecvInterrupted reports whether the server flagged a barge-in (event 450)
+// since the last poll. Non-blocking, mirroring the Gemini adapter so the bridge
+// can poll it on a ticker.
 func (d *Doubao) RecvInterrupted() (bool, error) {
-	// TODO: Implement when Doubao's VAD/barge-in API details are confirmed
-	return false, nil
+	select {
+	case <-d.ctx.Done():
+		return false, io.EOF
+	case <-d.interruptedCh:
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
-func (d *Doubao) SupportsInterruption() bool {
-	// TODO: Enable after verifying Doubao's VAD configuration
-	return false
-}
+// SupportsInterruption is true: Doubao runs server-side VAD and emits event 450
+// on the first word of user speech.
+func (d *Doubao) SupportsInterruption() bool { return true }
 
+// HandleInterrupted drops any model audio still queued locally so barge-in feels
+// immediate. The server stops generating on its own once it detects speech.
 func (d *Doubao) HandleInterrupted() error {
-	// TODO: Implement Doubao-specific interruption handling
+	d.drainAudioQueue()
 	return nil
+}
+
+func (d *Doubao) drainAudioQueue() {
+	for {
+		select {
+		case <-d.recvCh:
+		default:
+			return
+		}
+	}
+}
+
+func (d *Doubao) signalInterrupted() {
+	d.drainAudioQueue()
+	select {
+	case d.interruptedCh <- struct{}{}:
+	default:
+	}
 }
 
 func (d *Doubao) emitTranscript(role, text string, final bool) {
@@ -286,6 +394,7 @@ func (d *Doubao) readLoop() {
 	defer d.wg.Done()
 	defer close(d.recvCh)
 	defer close(d.transcriptCh)
+	defer close(d.interruptedCh)
 	for {
 		_, raw, err := d.conn.Read(d.ctx)
 		if err != nil {
@@ -310,6 +419,10 @@ func (d *Doubao) readLoop() {
 			case <-d.ctx.Done():
 				return
 			}
+		case dbEvASRInfo:
+			// First word of user speech detected: server-VAD barge-in. Drop queued
+			// model audio and signal the bridge so playback stops immediately.
+			d.signalInterrupted()
 		case dbEvASRResponse:
 			d.handleASR(payload)
 		case dbEvChatResponse:
