@@ -146,7 +146,7 @@ func NewWithVAD(ctx context.Context, vadCfg VADConfig) (*Gemini, error) {
 	}
 	modelName := os.Getenv("GEMINI_MODEL")
 	if modelName == "" {
-		modelName = "models/gemini-2.5-flash-native-audio-latest"
+		modelName = "models/gemini-3.1-flash-live-preview"
 	}
 
 	cctx, cancel := context.WithCancel(ctx)

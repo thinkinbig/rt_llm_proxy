@@ -90,7 +90,7 @@ Flags:
 Env:
 
 - **Gemini** — `GEMINI_API_KEY` / `GOOGLE_API_KEY`, optional `GEMINI_MODEL`
-  (default `models/gemini-2.5-flash-native-audio-latest`). The model must support
+  (default `models/gemini-3.1-flash-live-preview`). The model must support
   `bidiGenerateContent`; list the ones your key can use with:
   ```
   curl "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY&pageSize=200" \
