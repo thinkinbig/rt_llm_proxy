@@ -12,7 +12,11 @@ import (
 
 func main() {
 	loadDotenv(".env")
-	if err := runProxy(parseFlags()); err != nil {
+	cfg, setFlags, configPath := parseFlags()
+	if err := applyConfigFile(configPath, &cfg, setFlags); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	if err := runProxy(cfg); err != nil {
 		log.Fatal(err)
 	}
 }

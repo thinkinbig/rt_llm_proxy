@@ -108,11 +108,38 @@ function showTranscript(role, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
+// Browser-side tool implementations (demo stubs). A real app (e.g. the DJ) would
+// query a knowledge base / live API here. Each returns a plain object that is
+// sent back to the model as the function result.
+const toolHandlers = {
+  get_weather(args) {
+    const city = (args && args.city) || '某地';
+    return { city, temperature: '25°C', condition: '晴' };
+  },
+};
+
+function handleToolCall(msg) {
+  let args = msg.args || {};
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { args = {}; }
+  }
+  const handler = toolHandlers[msg.name];
+  const response = handler ? handler(args) : { error: 'unknown tool: ' + msg.name };
+  log(`tool ${msg.name}(${JSON.stringify(args)}) → ${JSON.stringify(response)}`);
+  if (dc && dc.readyState === 'open') {
+    dc.send(JSON.stringify({ type: 'tool_result', id: msg.id, name: msg.name, response }));
+  }
+}
+
 function handleDataChannelMessage(raw) {
   const line = dcText(raw).trim();
   if (!line) return;
   try {
     const msg = JSON.parse(line);
+    if (msg && msg.type === 'tool_call') {
+      handleToolCall(msg);
+      return;
+    }
     if (msg && typeof msg.role === 'string' && typeof msg.text === 'string') {
       if (Number.isFinite(msg.seq)) {
         sessionState.lastSeq = Math.max(sessionState.lastSeq, Number(msg.seq));
@@ -273,6 +300,13 @@ async function start() {
       headers['X-Session-ID'] = sessionState.id;
       headers['X-Last-Seq'] = String(sessionState.lastSeq);
       headers['X-Replay-Version'] = '1';
+    }
+    // DEV-ONLY: in production the orchestrator sets X-Listener-Brief server-side.
+    // For local testing, pass it via ?brief=... and we base64(UTF-8)-encode it.
+    const brief = new URLSearchParams(location.search).get('brief');
+    if (brief) {
+      headers['X-Listener-Brief'] = btoa(unescape(encodeURIComponent(brief)));
+      log('brief → ' + brief);
     }
     const resp = await fetch(`/?model=${model}`, {
       method: 'POST',

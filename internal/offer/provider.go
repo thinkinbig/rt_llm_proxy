@@ -12,7 +12,7 @@ import (
 // construction (e.g. doubao's dialog_context) consume it, while adapters that
 // restore post-hoc via model.ContextRestorer ignore it (nil for fresh sessions).
 type ModelFactory interface {
-	New(ctx context.Context, provider string, history []model.RestoredTurn) (model.Model, error)
+	New(ctx context.Context, provider string, history []model.RestoredTurn, params model.SessionParams) (model.Model, error)
 }
 
 // ParseProvider normalizes ?model= query values.

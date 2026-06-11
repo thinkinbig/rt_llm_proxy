@@ -52,6 +52,7 @@ const (
 	dbEvSessionFailed      = 153
 	dbEvTaskRequest        = 200
 	dbEvTTSResponse        = 352 // payload is raw audio
+	dbEvASRInfo            = 450 // first word of user speech detected → barge-in signal
 	dbEvASRResponse        = 451 // user speech recognition (JSON: results[].text)
 	dbEvChatResponse       = 550 // model reply text chunk (JSON: content)
 	dbEvChatEnded          = 559 // model turn complete

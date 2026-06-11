@@ -90,7 +90,7 @@ Flags:
 Env:
 
 - **Gemini** — `GEMINI_API_KEY` / `GOOGLE_API_KEY`, optional `GEMINI_MODEL`
-  (default `models/gemini-2.5-flash-native-audio-latest`). The model must support
+  (default `models/gemini-3.1-flash-live-preview`). The model must support
   `bidiGenerateContent`; list the ones your key can use with:
   ```
   curl "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY&pageSize=200" \
@@ -98,6 +98,50 @@ Env:
   ```
 - **Doubao** — `DOUBAO_APP_ID`, `DOUBAO_ACCESS_TOKEN` (开通豆包端到端实时语音大模型后获取),
   optional `DOUBAO_BOT_NAME`.
+
+### Provider behavior via config file
+
+Provider *behavior* (persona, voice, ASR tuning) is set in an optional YAML file,
+loaded from `proxy.yaml` by default (override with `-config path`; a missing file
+is skipped). Credentials and infrastructure flags are **not** in this file — keep
+secrets in `.env` and tune infra with CLI flags. Copy the template to start:
+
+```
+cp proxy.yaml.example proxy.yaml
+```
+
+Precedence: an explicitly-set CLI flag wins, then the config file, then built-in
+defaults. The provider-behavior fields below have no flags, so the file is their
+only source:
+
+| Section | Key | Effect |
+|---|---|---|
+| `gemini` | `system_prompt` | Live `systemInstruction` (persona without a dialogue turn) |
+| `gemini` | `tools` | function-calling declarations (name/description/JSON-Schema parameters) |
+| `doubao` | `model` | end-to-end version, required by the API (`1.2.1.1` O2.0 / `2.2.0.0` SC2.0; default `1.2.1.1`) |
+| `doubao` | `system_role`, `speaking_style` | persona / tone (O-series) |
+| `doubao` | `voice` | `tts.speaker` voice id |
+| `doubao` | `asr.twopass`, `asr.end_smooth_ms`, `asr.hotwords` | ASR accuracy tuning (hotwords need `twopass: true`) |
+| `cascade` | `system_prompt`, `tts_speaker`, `tts_lang`, `llm_model` | overrides matching `-cascade-*` flags when those flags are unset |
+
+**Tool calling (Gemini Live 3.1).** Declare tools under `gemini.tools`; the proxy
+declares them to the model and stays business-neutral. When the model calls a
+tool, the proxy forwards `{"type":"tool_call","id","name","args"}` to the browser
+over the data channel; the browser runs the function and replies
+`{"type":"tool_result","id","name","response"}`, which the proxy returns to the
+model. The demo ships a `get_weather` stub. (Doubao's direct protocol has no
+native function calling — only the RTC-room "混合编排" path does, which this proxy
+does not use.)
+
+**Per-session listener brief.** The offer request may carry an `X-Listener-Brief`
+header (base64 of UTF-8 text). It is appended to the provider's system prompt for
+that session only — injected as **system instruction**, never as a dialogue turn,
+so it cannot loop back into the transcript. Intended for an upstream orchestrator
+to inject per-user memory (e.g. "this listener likes Jay Chou, is studying"); the
+global persona stays in `proxy.yaml`, the per-user brief rides the header. Decoded
+best-effort (bad/oversize header → ignored), capped at 8 KiB. Note: the brief is
+trusted from the caller — in production the offer endpoint must be reachable only
+by the orchestrator, not browsers (currently it is not locked down).
 
 <a id="cascade"></a>
 

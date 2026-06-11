@@ -36,11 +36,13 @@ type fakeFactory struct {
 	newN            int
 	lastCtxCanceled bool
 	lastHistory     []model.RestoredTurn
+	lastParams      model.SessionParams
 }
 
-func (f *fakeFactory) New(ctx context.Context, _ string, history []model.RestoredTurn) (model.Model, error) {
+func (f *fakeFactory) New(ctx context.Context, _ string, history []model.RestoredTurn, params model.SessionParams) (model.Model, error) {
 	f.newN++
 	f.lastHistory = history
+	f.lastParams = params
 	if ctx != nil {
 		select {
 		case <-ctx.Done():

@@ -30,15 +30,50 @@ const (
 
 // VADConfig controls voice activity detection settings.
 type VADConfig struct {
-	Enabled             bool
+	Enabled                  bool
 	StartOfSpeechSensitivity float64
 	EndOfSpeechSensitivity   float64
 }
 
+// FunctionDeclaration declares one callable tool to the model. Parameters is a
+// JSON Schema object describing the arguments. These come from the proxy config
+// file — the proxy stays business-neutral and only forwards calls/results.
+type FunctionDeclaration struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+// Config holds session behavior for a Gemini Live connection. The API key and
+// model name still come from the environment (GEMINI_API_KEY / GEMINI_MODEL);
+// Config carries only the per-deployment behavior set from the proxy config file.
+type Config struct {
+	// SystemPrompt, when non-empty, is sent as the Live setup systemInstruction
+	// so the model adopts a persona without consuming a dialogue turn.
+	SystemPrompt string
+	VAD          VADConfig
+	// Tools, when non-empty, are declared to the model as functionDeclarations.
+	Tools []FunctionDeclaration
+}
+
 // --- wire format (BidiGenerateContent JSON over WS) ---
-// Field names match the google-genai SDK / v1beta proto JSON. The realtimeInput
-// shape is version-sensitive: older servers want "mediaChunks", newer ones also
-// accept "audio". We send mediaChunks for broad compatibility.
+// Field names match the google-genai SDK / v1beta proto JSON. Audio goes in
+// realtimeInput.audio: the legacy realtimeInput.mediaChunks form is rejected by
+// Live 3.1 ("media_chunks is deprecated. Use audio, video, or text instead").
+
+type geminiPart struct {
+	Text string `json:"text"`
+}
+
+type geminiContent struct {
+	Parts []geminiPart `json:"parts"`
+}
+
+// geminiTool is one entry of the setup "tools" array. The Live API groups
+// function declarations under a single tool object.
+type geminiTool struct {
+	FunctionDeclarations []FunctionDeclaration `json:"functionDeclarations,omitempty"`
+}
 
 type geminiSetup struct {
 	Setup struct {
@@ -51,8 +86,10 @@ type geminiSetup struct {
 				Disabled bool `json:"disabled,omitempty"`
 			} `json:"automaticActivityDetection,omitempty"`
 		} `json:"realtimeInputConfig,omitempty"`
-		InputAudioTranscription  struct{} `json:"inputAudioTranscription"`
-		OutputAudioTranscription struct{} `json:"outputAudioTranscription"`
+		InputAudioTranscription  struct{}       `json:"inputAudioTranscription"`
+		OutputAudioTranscription struct{}       `json:"outputAudioTranscription"`
+		SystemInstruction        *geminiContent `json:"systemInstruction,omitempty"`
+		Tools                    []geminiTool   `json:"tools,omitempty"`
 	} `json:"setup"`
 }
 
@@ -68,7 +105,7 @@ type geminiBlob struct {
 
 type geminiRealtimeInput struct {
 	RealtimeInput struct {
-		MediaChunks []geminiBlob `json:"mediaChunks"`
+		Audio *geminiBlob `json:"audio,omitempty"`
 	} `json:"realtimeInput"`
 }
 
@@ -84,10 +121,19 @@ type geminiClientContent struct {
 	} `json:"clientContent"`
 }
 
+type geminiToolCall struct {
+	FunctionCalls []struct {
+		ID   string          `json:"id"`
+		Name string          `json:"name"`
+		Args json.RawMessage `json:"args"`
+	} `json:"functionCalls"`
+}
+
 type geminiServerMsg struct {
 	SetupComplete       *struct{}            `json:"setupComplete"`
 	InputTranscription  *geminiTranscription `json:"inputTranscription"`
 	OutputTranscription *geminiTranscription `json:"outputTranscription"`
+	ToolCall            *geminiToolCall      `json:"toolCall"`
 	ServerContent       *struct {
 		TurnComplete        bool                 `json:"turnComplete"`
 		Interrupted         bool                 `json:"interrupted"`
@@ -115,28 +161,65 @@ type Gemini struct {
 	// Transcription arrives as deltas; we accumulate per role so the data
 	// channel carries the full sentence so far (the browser replaces the bubble
 	// body on each line). Reset at turn boundaries. Touched only by readLoop.
-	userBuf      strings.Builder
-	modelBuf     strings.Builder
-	interruptedCh chan struct{} // Signals user speech interruption from server
+	userBuf       strings.Builder
+	modelBuf      strings.Builder
+	interruptedCh chan struct{}       // Signals user speech interruption from server
+	toolCallCh    chan model.ToolCall // server tool calls; nil when no tools declared
 }
 
 var (
 	_ model.Model           = (*Gemini)(nil)
 	_ model.Transcriber     = (*Gemini)(nil)
 	_ model.ContextRestorer = (*Gemini)(nil)
+	_ model.ToolDispatcher  = (*Gemini)(nil)
 )
 
-func New(ctx context.Context) (*Gemini, error) {
-	// VAD enabled by default; set VAD_ENABLED=false to disable
-	enabled := os.Getenv("VAD_ENABLED") != "false"
-	return NewWithVAD(ctx, VADConfig{
-		Enabled:                  enabled,
+// EnvVAD returns the default VAD settings: enabled unless VAD_ENABLED=false,
+// with 0.5 sensitivities. The composition root uses it so VAD stays
+// env-controlled while the rest of Config comes from the proxy config file.
+func EnvVAD() VADConfig {
+	return VADConfig{
+		Enabled:                  os.Getenv("VAD_ENABLED") != "false",
 		StartOfSpeechSensitivity: 0.5,
 		EndOfSpeechSensitivity:   0.5,
-	})
+	}
 }
 
+func New(ctx context.Context) (*Gemini, error) {
+	return NewWithConfig(ctx, Config{VAD: EnvVAD()})
+}
+
+// NewWithVAD dials Gemini with only VAD settings. Retained for callers that do
+// not need the wider Config; delegates to NewWithConfig.
 func NewWithVAD(ctx context.Context, vadCfg VADConfig) (*Gemini, error) {
+	return NewWithConfig(ctx, Config{VAD: vadCfg})
+}
+
+// buildSetup assembles the Live setup message. SystemPrompt becomes
+// systemInstruction (omitted when empty); manual VAD is requested only when
+// disabled, otherwise the field is left off so the server keeps auto VAD.
+func buildSetup(modelName string, cfg Config) geminiSetup {
+	var setup geminiSetup
+	setup.Setup.Model = modelName
+	setup.Setup.GenerationConfig.ResponseModalities = []string{"AUDIO"}
+	setup.Setup.InputAudioTranscription = struct{}{}
+	setup.Setup.OutputAudioTranscription = struct{}{}
+	if cfg.SystemPrompt != "" {
+		setup.Setup.SystemInstruction = &geminiContent{Parts: []geminiPart{{Text: cfg.SystemPrompt}}}
+	}
+	if len(cfg.Tools) > 0 {
+		setup.Setup.Tools = []geminiTool{{FunctionDeclarations: cfg.Tools}}
+	}
+	if !cfg.VAD.Enabled {
+		setup.Setup.RealtimeInputConfig.AutomaticActivityDetection = &struct {
+			Disabled bool `json:"disabled,omitempty"`
+		}{Disabled: true}
+	}
+	return setup
+}
+
+func NewWithConfig(ctx context.Context, cfg Config) (*Gemini, error) {
+	vadCfg := cfg.VAD
 	key := os.Getenv("GEMINI_API_KEY")
 	if key == "" {
 		key = os.Getenv("GOOGLE_API_KEY")
@@ -146,7 +229,7 @@ func NewWithVAD(ctx context.Context, vadCfg VADConfig) (*Gemini, error) {
 	}
 	modelName := os.Getenv("GEMINI_MODEL")
 	if modelName == "" {
-		modelName = "models/gemini-2.5-flash-native-audio-latest"
+		modelName = "models/gemini-3.1-flash-live-preview"
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -161,22 +244,10 @@ func NewWithVAD(ctx context.Context, vadCfg VADConfig) (*Gemini, error) {
 		ctx: cctx, cancel: cancel, conn: conn, vadCfg: vadCfg,
 		recvCh: make(chan []int16, 64), textCh: make(chan model.Transcript, 64),
 		interruptedCh: make(chan struct{}, 1),
+		toolCallCh:    make(chan model.ToolCall, 8),
 	}
 
-	var setup geminiSetup
-	setup.Setup.Model = modelName
-	setup.Setup.GenerationConfig.ResponseModalities = []string{"AUDIO"}
-	setup.Setup.InputAudioTranscription = struct{}{}
-	setup.Setup.OutputAudioTranscription = struct{}{}
-	// Live API expects automaticActivityDetection to be an object (not a bool).
-	// Keep server-side auto VAD by default (omit the field entirely). Only send
-	// explicit config for manual VAD mode.
-	if !vadCfg.Enabled {
-		setup.Setup.RealtimeInputConfig.AutomaticActivityDetection = &struct {
-			Disabled bool `json:"disabled,omitempty"`
-		}{Disabled: true}
-	}
-	if err := g.writeJSON(setup); err != nil {
+	if err := g.writeJSON(buildSetup(modelName, cfg)); err != nil {
 		g.Close()
 		return nil, fmt.Errorf("gemini: setup: %w", err)
 	}
@@ -199,10 +270,10 @@ func (g *Gemini) writeJSON(v any) error {
 func (g *Gemini) SendAudio(pcmSamples []int16) error {
 	in := audio.ResampleLinear(pcmSamples, audio.OpusRate, geminiInRate)
 	var msg geminiRealtimeInput
-	msg.RealtimeInput.MediaChunks = []geminiBlob{{
+	msg.RealtimeInput.Audio = &geminiBlob{
 		MimeType: "audio/pcm;rate=" + strconv.Itoa(geminiInRate),
 		Data:     base64.StdEncoding.EncodeToString(pcm.ToBytes(in)),
-	}}
+	}
 	return g.writeJSON(msg)
 }
 
@@ -298,6 +369,59 @@ func (g *Gemini) SupportsInterruption() bool {
 	return g.vadCfg.Enabled
 }
 
+// handleToolCall fans the server's function calls into toolCallCh for the bridge.
+func (g *Gemini) handleToolCall(tc *geminiToolCall) {
+	for _, fc := range tc.FunctionCalls {
+		call := model.ToolCall{ID: fc.ID, Name: fc.Name, Args: fc.Args}
+		select {
+		case g.toolCallCh <- call:
+		case <-g.ctx.Done():
+			return
+		}
+	}
+}
+
+// RecvToolCall implements model.ToolDispatcher: blocks for the next tool call.
+func (g *Gemini) RecvToolCall() (model.ToolCall, error) {
+	select {
+	case <-g.ctx.Done():
+		return model.ToolCall{}, io.EOF
+	case call, ok := <-g.toolCallCh:
+		if !ok {
+			return model.ToolCall{}, io.EOF
+		}
+		return call, nil
+	}
+}
+
+// geminiToolResponse is the client toolResponse message returning function results.
+type geminiToolResponse struct {
+	ToolResponse struct {
+		FunctionResponses []geminiFunctionResponse `json:"functionResponses"`
+	} `json:"toolResponse"`
+}
+
+type geminiFunctionResponse struct {
+	ID       string          `json:"id"`
+	Name     string          `json:"name"`
+	Response json.RawMessage `json:"response"`
+}
+
+// SendToolResult implements model.ToolDispatcher: returns a function result to
+// the model so it can continue the turn. A nil Response is sent as {} so the
+// wire stays a valid JSON object.
+func (g *Gemini) SendToolResult(res model.ToolResult) error {
+	resp := res.Response
+	if len(resp) == 0 {
+		resp = json.RawMessage(`{}`)
+	}
+	var msg geminiToolResponse
+	msg.ToolResponse.FunctionResponses = []geminiFunctionResponse{{
+		ID: res.ID, Name: res.Name, Response: resp,
+	}}
+	return g.writeJSON(msg)
+}
+
 func (g *Gemini) HandleInterrupted() error {
 	// Gemini sends an interruption signal, but we may still have already-buffered
 	// audio chunks queued locally. Drain them so barge-in feels immediate.
@@ -344,6 +468,7 @@ func (g *Gemini) readLoop() {
 	defer close(g.recvCh)
 	defer close(g.textCh)
 	defer close(g.interruptedCh)
+	defer close(g.toolCallCh)
 	first := true
 	for {
 		_, data, err := g.conn.Read(g.ctx)
@@ -361,6 +486,9 @@ func (g *Gemini) readLoop() {
 		}
 		g.handleTranscription("user", msg.InputTranscription)
 		g.handleTranscription("model", msg.OutputTranscription)
+		if msg.ToolCall != nil {
+			g.handleToolCall(msg.ToolCall)
+		}
 		if msg.ServerContent == nil {
 			continue
 		}

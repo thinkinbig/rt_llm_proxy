@@ -61,6 +61,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		SessionIDHeader:     r.Header.Get("X-Session-ID"),
 		LastSeqHeader:       r.Header.Get("X-Last-Seq"),
 		ReplayVersionHeader: r.Header.Get("X-Replay-Version"),
+		ListenerBriefHeader: r.Header.Get("X-Listener-Brief"),
 	})
 	writeIntakeResult(w, res)
 }
@@ -106,6 +107,7 @@ type HandlerFields struct {
 	Auth       *auth.Authenticator
 	Publisher   sidechannel.Publisher
 	ReplayIndex Replayer
+	Memory      MemoryProvider
 	Guard       *modelcb.Manager
 	Hub         MediaHub
 	Models      ModelFactory
@@ -120,6 +122,7 @@ func (f HandlerFields) Build() *Handler {
 		Auth:      f.Auth,
 		Publisher:   f.Publisher,
 		ReplayIndex: f.ReplayIndex,
+		Memory:      f.Memory,
 		Guard:       f.Guard,
 		Hub:       f.Hub,
 		Models:    f.Models,

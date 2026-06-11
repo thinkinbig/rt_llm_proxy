@@ -1,0 +1,55 @@
+# Copy to proxy.yaml (auto-loaded from the working directory; override path with
+# -config). This file configures provider *behavior* only. Infrastructure knobs
+# (listen address, rate limiting, circuit breaker, kafka, replay, opus) stay on
+# CLI flags / env. Credentials (GEMINI_API_KEY, DOUBAO_APP_ID, …) are NEVER read
+# from here — keep them in .env / the environment.
+#
+# Precedence: a CLI flag set on the command line wins; otherwise this file;
+# otherwise the built-in default. Empty / omitted fields leave the provider's
+# own defaults in place.
+
+# --- Gemini Live ---
+gemini:
+  # Sent as the Live setup systemInstruction so the model adopts a persona
+  # without spending a dialogue turn. Empty = no system instruction.
+  system_prompt: "You are a helpful, concise voice assistant."
+  # Note: VAD stays env-controlled via VAD_ENABLED (default on). Model name via
+  # GEMINI_MODEL (default models/gemini-3.1-flash-live-preview).
+  #
+  # Tools the model may call (function calling). Each call is forwarded to the
+  # browser over the data channel as {"type":"tool_call",...}; the browser runs
+  # the function and replies {"type":"tool_result",...}. parameters is a JSON
+  # Schema object. The demo ships a get_weather stub — uncomment to try it.
+  # tools:
+  #   - name: get_weather
+  #     description: Get the current weather for a city
+  #     parameters:
+  #       type: object
+  #       properties:
+  #         city:
+  #           type: string
+  #           description: City name, e.g. Beijing
+  #       required: [city]
+
+# --- Doubao 端到端实时语音 ---
+doubao:
+  # 端到端模型版本（API 必传；默认 1.2.1.1）。1.2.1.1 = O2.0（精品音色）；
+  # 2.2.0.0 = SC2.0（声音复刻/角色扮演）。注意音色必须与版本匹配。
+  model: "1.2.1.1"
+  bot_name: "豆包"
+  system_role: "你是一个专业的AI语音助手。"      # O 系列：身份背景
+  speaking_style: "用简洁友好的口吻交流。"        # O 系列：说话口吻
+  voice: "zh_female_vv_jupiter_bigtts"          # tts.speaker（O 系列精品音色）
+  asr:
+    twopass: false        # 二遍识别（付费）；热词仅在 twopass=true 时生效
+    end_smooth_ms: 800    # 判停窗口（毫秒）
+    hotwords:             # 直传热词，提升专有名词识别
+      - "火山引擎"
+
+# --- Cascade (self-hosted ASR → LLM → TTS) ---
+# These also have CLI flags (-cascade-*); a set flag overrides this file.
+cascade:
+  system_prompt: "You are a helpful voice assistant."
+  tts_speaker: ""
+  tts_lang: "en"
+  llm_model: "Qwen3.5-9B"

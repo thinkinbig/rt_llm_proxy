@@ -1,6 +1,9 @@
 # local secrets — never commit
 .env
 
+# local provider config — copy from proxy.yaml.example
+proxy.yaml
+
 # build artifacts
 /proxy
 /rtproxy

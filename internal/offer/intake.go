@@ -2,9 +2,11 @@ package offer
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,10 +30,13 @@ type Intake struct {
 	Publisher sidechannel.Publisher
 	// ReplayIndex queries the replay-index service for cross-node reconnect restore.
 	ReplayIndex Replayer
-	Guard       *modelcb.Manager
-	Hub         MediaHub
-	Models      ModelFactory
-	Replay      ReplayConfig
+	// Memory fetches the per-user listener brief injected at session start; nil
+	// falls back to the dev X-Listener-Brief header.
+	Memory   MemoryProvider
+	Guard    *modelcb.Manager
+	Hub      MediaHub
+	Models   ModelFactory
+	Replay   ReplayConfig
 	Observer ReplayObserver
 }
 
@@ -45,6 +50,31 @@ type IntakeRequest struct {
 	SessionIDHeader     string
 	LastSeqHeader       string
 	ReplayVersionHeader string
+	// ListenerBriefHeader is the base64 (std) per-session system suffix injected
+	// by the trusted orchestrator (X-Listener-Brief). Decoded best-effort.
+	ListenerBriefHeader string
+}
+
+// maxListenerBrief caps the decoded per-session system suffix to bound context
+// cost and limit injection size.
+const maxListenerBrief = 8 << 10 // 8 KiB
+
+// decodeListenerBrief decodes the base64 X-Listener-Brief header into the
+// per-session system suffix. Best-effort: a malformed header yields "" rather
+// than failing the session; oversize input is truncated to valid UTF-8.
+func decodeListenerBrief(header string) string {
+	if header == "" {
+		return ""
+	}
+	b, err := base64.StdEncoding.DecodeString(header)
+	if err != nil {
+		log.Printf("offer: bad X-Listener-Brief base64: %v", err)
+		return ""
+	}
+	if len(b) > maxListenerBrief {
+		b = b[:maxListenerBrief]
+	}
+	return strings.ToValidUTF8(string(b), "")
 }
 
 // IntakeResult is the offer outcome for the HTTP adapter to write.
@@ -122,7 +152,11 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 		}
 	}
 
-	m, err := in.Models.New(modelCtx, provider, restoredTurns(replay.InitialHistory))
+	params := model.SessionParams{SystemSuffix: resolveBrief(ctx, in.Memory, req.UserID, req.ListenerBriefHeader)}
+	if params.SystemSuffix != "" {
+		log.Printf("offer: applying listener brief (%d bytes) provider=%s", len(params.SystemSuffix), provider)
+	}
+	m, err := in.Models.New(modelCtx, provider, restoredTurns(replay.InitialHistory), params)
 	in.Guard.RecordDial(provider, err, now)
 	if err != nil {
 		log.Printf("model connect: %v", err)

@@ -28,14 +28,21 @@ type CascadeConfig struct {
 }
 
 // ProdModelFactory connects real provider adapters for production wiring.
+// Gemini and Doubao carry per-deployment behavior (persona, voice, ASR tuning)
+// resolved at startup from flags and the config file; credentials still come
+// from the environment inside each adapter.
 type ProdModelFactory struct {
 	Cascade CascadeConfig
+	Gemini  gemini.Config
+	Doubao  doubao.Config
 }
 
-func (f ProdModelFactory) New(ctx context.Context, provider string, history []model.RestoredTurn) (model.Model, error) {
+func (f ProdModelFactory) New(ctx context.Context, provider string, history []model.RestoredTurn, params model.SessionParams) (model.Model, error) {
 	switch provider {
 	case "doubao":
-		return doubao.NewWithHistory(ctx, history)
+		cfg := f.Doubao
+		cfg.SystemRole = joinSystem(cfg.SystemRole, params.SystemSuffix)
+		return doubao.NewWithConfig(ctx, cfg, history)
 	case "loopback":
 		return loopback.New(), nil
 	case "cascade":
@@ -57,9 +64,24 @@ func (f ProdModelFactory) New(ctx context.Context, provider string, history []mo
 			LLM:        llm.New(f.Cascade.LLMURL, f.Cascade.LLMModel),
 			TTS:        ttsStage,
 			TurnDetect: td,
-			System:     f.Cascade.System,
+			System:     joinSystem(f.Cascade.System, params.SystemSuffix),
 		})
 	default:
-		return gemini.New(ctx)
+		cfg := f.Gemini
+		cfg.SystemPrompt = joinSystem(cfg.SystemPrompt, params.SystemSuffix)
+		return gemini.NewWithConfig(ctx, cfg)
+	}
+}
+
+// joinSystem appends a per-session suffix to a base system prompt, separated by a
+// blank line. Either side may be empty.
+func joinSystem(base, suffix string) string {
+	switch {
+	case suffix == "":
+		return base
+	case base == "":
+		return suffix
+	default:
+		return base + "\n\n" + suffix
 	}
 }
