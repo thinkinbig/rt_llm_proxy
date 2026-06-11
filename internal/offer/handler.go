@@ -107,6 +107,7 @@ type HandlerFields struct {
 	Auth       *auth.Authenticator
 	Publisher   sidechannel.Publisher
 	ReplayIndex Replayer
+	Memory      MemoryProvider
 	Guard       *modelcb.Manager
 	Hub         MediaHub
 	Models      ModelFactory
@@ -121,6 +122,7 @@ func (f HandlerFields) Build() *Handler {
 		Auth:      f.Auth,
 		Publisher:   f.Publisher,
 		ReplayIndex: f.ReplayIndex,
+		Memory:      f.Memory,
 		Guard:       f.Guard,
 		Hub:       f.Hub,
 		Models:    f.Models,

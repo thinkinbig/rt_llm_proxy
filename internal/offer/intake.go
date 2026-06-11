@@ -30,10 +30,13 @@ type Intake struct {
 	Publisher sidechannel.Publisher
 	// ReplayIndex queries the replay-index service for cross-node reconnect restore.
 	ReplayIndex Replayer
-	Guard       *modelcb.Manager
-	Hub         MediaHub
-	Models      ModelFactory
-	Replay      ReplayConfig
+	// Memory fetches the per-user listener brief injected at session start; nil
+	// falls back to the dev X-Listener-Brief header.
+	Memory   MemoryProvider
+	Guard    *modelcb.Manager
+	Hub      MediaHub
+	Models   ModelFactory
+	Replay   ReplayConfig
 	Observer ReplayObserver
 }
 
@@ -149,7 +152,7 @@ func (in *Intake) ServeOffer(req IntakeRequest) IntakeResult {
 		}
 	}
 
-	params := model.SessionParams{SystemSuffix: decodeListenerBrief(req.ListenerBriefHeader)}
+	params := model.SessionParams{SystemSuffix: resolveBrief(ctx, in.Memory, req.UserID, req.ListenerBriefHeader)}
 	if params.SystemSuffix != "" {
 		log.Printf("offer: applying listener brief (%d bytes) provider=%s", len(params.SystemSuffix), provider)
 	}
