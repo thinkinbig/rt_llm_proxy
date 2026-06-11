@@ -68,6 +68,22 @@ func (noopReplayObserver) ObserveHit(string, time.Duration) {}
 func (noopReplayObserver) ObserveTimeout(string)            {}
 func (noopReplayObserver) ObserveError(string)              {}
 
+// ReplayStatus is the X-Replay-Status response header value reporting how a
+// reconnect resolved. The full vocabulary is declared here so an operator can
+// read every possible value in one place (it is serialized to the header, never
+// branched on in Go).
+type ReplayStatus = string
+
+const (
+	StatusDisabled        ReplayStatus = "disabled"         // replay not enabled / not applicable
+	StatusMiss            ReplayStatus = "miss"             // requested but nothing to restore
+	StatusMemoryHit       ReplayStatus = "memory_hit"       // resumed from the same-node in-memory archive
+	StatusIndexTimeout    ReplayStatus = "index_timeout"    // replay-index lookup timed out
+	StatusIndexError      ReplayStatus = "index_error"      // replay-index lookup errored
+	StatusIndexHit        ReplayStatus = "index_hit"        // restored cross-node from the replay-index
+	StatusProtocolInvalid ReplayStatus = "protocol_invalid" // reconnect headers failed validation
+)
+
 // ReplayOutcome is the reconnect transcript state applied to a new session.
 type ReplayOutcome struct {
 	SessionID      identity.SessionID
@@ -121,10 +137,10 @@ func ResolveReplay(
 	}
 	out := ReplayOutcome{
 		SessionID: newSessionID,
-		Status:    "disabled",
+		Status:    StatusDisabled,
 	}
 	if cfg.Enabled {
-		out.Status = "miss"
+		out.Status = StatusMiss
 	}
 	if !headers.Requested || headers.Incomplete {
 		return out, nil
@@ -154,12 +170,12 @@ func ResolveReplay(
 		out.StartSeq = baseSeq
 		out.InitialHistory = full
 		out.ReplayLines = missing
-		out.Status = "memory_hit"
+		out.Status = StatusMemoryHit
 		return out, nil
 	}
 
 	if !cfg.Enabled {
-		out.Status = "disabled"
+		out.Status = StatusDisabled
 		return out, nil
 	}
 	if index == nil {
@@ -174,10 +190,10 @@ func ResolveReplay(
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(replayCtx.Err(), context.DeadlineExceeded) {
 			obs.ObserveTimeout("index")
-			out.Status = "index_timeout"
+			out.Status = StatusIndexTimeout
 		} else {
 			obs.ObserveError("index")
-			out.Status = "index_error"
+			out.Status = StatusIndexError
 		}
 		return out, nil
 	}
@@ -197,7 +213,7 @@ func ResolveReplay(
 		}
 	}
 	out.StartSeq = startSeq
-	out.Status = "index_hit"
+	out.Status = StatusIndexHit
 	return out, nil
 }
 

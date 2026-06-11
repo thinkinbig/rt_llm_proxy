@@ -241,7 +241,7 @@ func replayProtocolReject(msg string) IntakeResult {
 		Status: 400,
 		Headers: map[string]string{
 			"X-Replay-Version": ReplayProtocolVersion(),
-			"X-Replay-Status":  "protocol_invalid",
+			"X-Replay-Status":  StatusProtocolInvalid,
 		},
 		Body: msg,
 	}

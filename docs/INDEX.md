@@ -169,9 +169,10 @@ Want to test if this works for your idea?
 Integrating rt-llm-proxy into your product?
 
 1. [Quick Start](QUICK_START.md) — understand basics
-2. [FAQ — Library Use](FAQ.md#can-i-use-it-as-a-library-in-my-app) — embed in your app
-3. [ARCHITECTURE.md §3](ARCHITECTURE.md#3-modules--seams) — module seams and interfaces
-4. Check `internal/model` for provider adapters
+2. [Integration Guide](INTEGRATION.md) — the three seams to close (identity, memory, endpoint trust) when embedding in a downstream service
+3. [FAQ — Library Use](FAQ.md#can-i-use-it-as-a-library-in-my-app) — embed in your app
+4. [ARCHITECTURE.md §3](ARCHITECTURE.md#3-modules--seams) — module seams and interfaces
+5. Check `internal/model` for provider adapters
 
 ### Scenario: Setting Up Production
 

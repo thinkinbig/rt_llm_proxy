@@ -17,6 +17,29 @@ text, provider STT via `RecvTranscript`) call `Record(role, text)`.
 A provider adapter emits `model.Transcript{Role, Text}` without session context.
 The Bridge converts it to a **transcript line** at the recording point.
 
+## Data-channel protocol
+
+`rtc/dcproto` owns the browser-facing data-channel wire contract: it encodes
+outbound **transcript lines** (bare `{seq,role,text}`, no type tag) and model
+**tool calls** (`{"type":"tool_call",...}`), and classifies inbound strings via
+`Decode` — a `{"type":"tool_result",...}` envelope yields a `model.ToolResult`,
+anything else (plain text or any other JSON) is user text. The format is
+asymmetric by design (tools tagged, transcript untagged) to match the existing
+client. `Decode` only classifies; the **Bridge** keeps the capability gate
+(routing a tool_result requires a `model.ToolDispatcher`).
+
+## Model capabilities
+
+A provider's optional capabilities — `ContextRestorer`, `Transcriber`,
+`ToolDispatcher`, `Interrupter` — are resolved in one place by `model.Resolve`,
+which returns a `model.Capabilities` value (each field nil when absent). The
+**Bridge** calls it once and reads the resolved set instead of scattering type
+assertions across `Serve`. `Interrupter` unifies the three barge-in methods that
+were once split across `Model` and `Transcriber`; it is resolved only when the
+model both implements it **and** reports `SupportsInterruption()` (a runtime gate
+— e.g. gemini, only when VAD is enabled). Adding a capability touches only
+`model.Resolve`.
+
 ## Side-channel tap
 
 `sidechannel.Tap` implements `transcript.Listener` and publishes

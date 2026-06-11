@@ -46,9 +46,23 @@ type ContextRestorer interface {
 // transcripts to the browser data channel.
 type Transcriber interface {
 	RecvTranscript() (Transcript, error)
+}
+
+// Interrupter is an optional Model capability: providers that support VAD-based
+// barge-in implement it. It gathers all three interruption methods that used to
+// be split across Model and Transcriber, so capability resolution has a single
+// seam. SupportsInterruption is a runtime gate (e.g. gemini reports it only when
+// VAD is enabled for the session); a model implements Interrupter but is treated
+// as interruptible only when SupportsInterruption returns true.
+type Interrupter interface {
+	// SupportsInterruption reports whether interruption is active for this session.
+	SupportsInterruption() bool
 	// RecvInterrupted checks if the model detected user speech interruption (barge-in).
 	// Returns (true, nil) if interrupted, (false, nil) if not, or (_, err) on error.
 	RecvInterrupted() (bool, error)
+	// HandleInterrupted is called when user speech is detected during model reply.
+	// Implementations should cancel in-flight generation and drain queued audio.
+	HandleInterrupted() error
 }
 
 // ToolCall is a function-call request emitted by a model that supports tool use.
@@ -88,9 +102,4 @@ type Model interface {
 	// Returns io.EOF when the session is closed.
 	Recv() ([]int16, error)
 	Close() error
-	// SupportsInterruption returns true if the model natively supports VAD-based interruption.
-	SupportsInterruption() bool
-	// HandleInterrupted is called when user speech is detected during model reply.
-	// Implementations should cancel in-flight generation and drain queued audio.
-	HandleInterrupted() error
 }

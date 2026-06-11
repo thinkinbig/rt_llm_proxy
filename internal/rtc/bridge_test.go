@@ -2,15 +2,21 @@ package rtc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
+	"github.com/thinkinbig/rt-llm-proxy/internal/model"
 	"github.com/thinkinbig/rt-llm-proxy/internal/transcript"
 )
 
@@ -270,5 +276,165 @@ func TestWriteOutboundLoopStopsOnContextDone(t *testing.T) {
 	case <-done:
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("writeOutboundLoop did not stop after context cancellation")
+	}
+}
+
+// --- narrow-interface fakes for the data-channel + inbound-audio pumps ---
+
+type fakeTextSender struct {
+	mu    sync.Mutex
+	state webrtc.DataChannelState
+	sent  []string
+}
+
+func (f *fakeTextSender) SendText(s string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, s)
+	return nil
+}
+
+func (f *fakeTextSender) ReadyState() webrtc.DataChannelState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state
+}
+
+func (f *fakeTextSender) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sent)
+}
+
+type fakeTranscriber struct {
+	trs []model.Transcript
+	i   int
+}
+
+func (f *fakeTranscriber) RecvTranscript() (model.Transcript, error) {
+	if f.i >= len(f.trs) {
+		return model.Transcript{}, io.EOF
+	}
+	t := f.trs[f.i]
+	f.i++
+	return t, nil
+}
+
+type fakeToolDispatcher struct {
+	calls []model.ToolCall
+	i     int
+}
+
+func (f *fakeToolDispatcher) RecvToolCall() (model.ToolCall, error) {
+	if f.i >= len(f.calls) {
+		return model.ToolCall{}, io.EOF
+	}
+	c := f.calls[f.i]
+	f.i++
+	return c, nil
+}
+
+func (f *fakeToolDispatcher) SendToolResult(model.ToolResult) error { return nil }
+
+type fakeRTPReader struct {
+	pkts []*rtp.Packet
+	i    int
+}
+
+func (f *fakeRTPReader) ReadRTP() (*rtp.Packet, interceptor.Attributes, error) {
+	if f.i >= len(f.pkts) {
+		return nil, nil, io.EOF
+	}
+	p := f.pkts[f.i]
+	f.i++
+	return p, nil, nil
+}
+
+type fakeDecoder struct{ failAt, calls int }
+
+func (d *fakeDecoder) Decode(b []byte) ([]int16, error) {
+	d.calls++
+	if d.failAt > 0 && d.calls == d.failAt {
+		return nil, errors.New("decode fail")
+	}
+	return []int16{int16(len(b))}, nil
+}
+
+type fakeAudioSink struct {
+	pcms   [][]int16
+	failAt int
+	calls  int
+}
+
+func (s *fakeAudioSink) SendAudio(p []int16) error {
+	s.calls++
+	if s.failAt > 0 && s.calls == s.failAt {
+		return errors.New("send fail")
+	}
+	s.pcms = append(s.pcms, p)
+	return nil
+}
+
+func TestForwardTranscriptsRecordsAndSends(t *testing.T) {
+	sender := &fakeTextSender{state: webrtc.DataChannelStateOpen}
+	tr := &fakeTranscriber{trs: []model.Transcript{{Role: "model", Text: "hello"}}}
+	sess := &session{rec: transcript.NewRecorder(0, nil, 256, transcript.SessionMeta{}, transcript.NopListener{})}
+	forwardTranscripts(context.Background(), sender, tr, sess)
+	if sender.count() != 1 {
+		t.Fatalf("want 1 send, got %d", sender.count())
+	}
+	if !strings.Contains(sender.sent[0], "hello") {
+		t.Fatalf("sent missing transcript text: %s", sender.sent[0])
+	}
+}
+
+func TestForwardToolCallsEncodesAndSends(t *testing.T) {
+	sender := &fakeTextSender{state: webrtc.DataChannelStateOpen}
+	td := &fakeToolDispatcher{calls: []model.ToolCall{{ID: "a", Name: "play", Args: json.RawMessage(`{}`)}}}
+	forwardToolCalls(context.Background(), sender, td)
+	if sender.count() != 1 || !strings.Contains(sender.sent[0], "play") {
+		t.Fatalf("tool call not forwarded: %v", sender.sent)
+	}
+}
+
+func TestForwardToolCallsStopsWhenChannelClosed(t *testing.T) {
+	sender := &fakeTextSender{state: webrtc.DataChannelStateClosed}
+	td := &fakeToolDispatcher{calls: []model.ToolCall{{ID: "a", Name: "play", Args: json.RawMessage(`{}`)}}}
+	forwardToolCalls(context.Background(), sender, td)
+	if sender.count() != 0 {
+		t.Fatalf("must not send on a non-open channel: %v", sender.sent)
+	}
+}
+
+func TestReadInboundLoopSkipsEmptyAndForwards(t *testing.T) {
+	pkts := []*rtp.Packet{
+		{Payload: nil},             // empty -> skipped
+		{Payload: []byte{1, 2, 3}}, // decoded + forwarded
+	}
+	sink := &fakeAudioSink{}
+	readInboundLoop(&fakeRTPReader{pkts: pkts}, &fakeDecoder{}, sink)
+	if len(sink.pcms) != 1 {
+		t.Fatalf("want 1 forwarded pcm (empty skipped), got %d", len(sink.pcms))
+	}
+}
+
+func TestReadInboundLoopContinuesOnDecodeError(t *testing.T) {
+	pkts := []*rtp.Packet{
+		{Payload: []byte{1}}, // decode fails -> continue
+		{Payload: []byte{2}}, // decoded + forwarded
+	}
+	sink := &fakeAudioSink{}
+	readInboundLoop(&fakeRTPReader{pkts: pkts}, &fakeDecoder{failAt: 1}, sink)
+	if len(sink.pcms) != 1 {
+		t.Fatalf("decode error not skipped: got %d forwarded", len(sink.pcms))
+	}
+}
+
+func TestReadInboundLoopExitsOnSinkError(t *testing.T) {
+	pkts := []*rtp.Packet{{Payload: []byte{1}}, {Payload: []byte{2}}}
+	sink := &fakeAudioSink{failAt: 1}
+	readInboundLoop(&fakeRTPReader{pkts: pkts}, &fakeDecoder{}, sink)
+	if sink.calls != 1 {
+		t.Fatalf("must exit after first sink error, calls=%d", sink.calls)
 	}
 }

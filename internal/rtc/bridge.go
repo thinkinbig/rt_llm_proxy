@@ -10,12 +10,12 @@ package rtc
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"sync"
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
@@ -23,6 +23,7 @@ import (
 	"github.com/thinkinbig/rt-llm-proxy/internal/identity"
 	"github.com/thinkinbig/rt-llm-proxy/internal/metrics"
 	"github.com/thinkinbig/rt-llm-proxy/internal/model"
+	"github.com/thinkinbig/rt-llm-proxy/internal/rtc/dcproto"
 	"github.com/thinkinbig/rt-llm-proxy/internal/transcript"
 )
 
@@ -241,6 +242,28 @@ type frameEncoder interface {
 	Encode([]int16) ([]byte, error)
 }
 
+// textSender is the narrow data-channel surface the outbound text pumps need:
+// *webrtc.DataChannel satisfies it, and tests fake it without a PeerConnection.
+type textSender interface {
+	SendText(string) error
+	ReadyState() webrtc.DataChannelState
+}
+
+// rtpReader / frameDecoder / audioSink are the narrow inbound-audio surfaces:
+// *webrtc.TrackRemote, the opus decoder, and model.Model satisfy them so
+// readInboundLoop's decode/forward logic is testable against fakes.
+type rtpReader interface {
+	ReadRTP() (*rtp.Packet, interceptor.Attributes, error)
+}
+
+type frameDecoder interface {
+	Decode([]byte) ([]int16, error)
+}
+
+type audioSink interface {
+	SendAudio([]int16) error
+}
+
 // Serve sets up the peer connection for one session and returns the answer SDP.
 // Media bridging runs in background goroutines that tear down when the
 // connection drops, the model session ends, or the hub is closed.
@@ -290,13 +313,17 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 			info.Transcript,
 		),
 	}
+	// Resolve the model's optional capabilities once; the wiring below reads the
+	// resolved set instead of scattering type assertions.
+	caps := model.Resolve(m)
+
 	// Reconnect: seed the freshly-dialed model with the restored conversation so
 	// it resumes with dialogue context instead of amnesia. Best-effort and
 	// provider-dependent — models that can't accept injected context (pure
 	// speech-to-speech, e.g. doubao) don't implement ContextRestorer and are
 	// skipped. The proxy recorder is already seeded above via InitialHistory.
-	if r, ok := m.(model.ContextRestorer); ok && len(info.InitialHistory) > 0 {
-		if err := r.RestoreContext(restoredTurns(info.InitialHistory)); err != nil {
+	if caps.Restorer != nil && len(info.InitialHistory) > 0 {
+		if err := caps.Restorer.RestoreContext(restoredTurns(info.InitialHistory)); err != nil {
 			log.Printf("rtc: context restore: %v", err)
 		}
 	}
@@ -329,31 +356,29 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 	// tool-calls -> browser.
 	var replayOnce sync.Once
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		td, hasTools := m.(model.ToolDispatcher)
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if !msg.IsString {
 				return
 			}
 			// A tool-result envelope is routed to the model; anything else is
 			// treated as user text input.
-			if hasTools {
-				if res, ok := parseToolResult(msg.Data); ok {
-					_ = td.SendToolResult(res)
+			if caps.Tools != nil {
+				if res, ok := dcproto.Decode(msg.Data); ok {
+					_ = caps.Tools.SendToolResult(res)
 					return
 				}
 			}
 			sess.rec.Record("user", string(msg.Data))
 			_ = m.SendText(string(msg.Data))
 		})
-		t, hasTranscript := m.(model.Transcriber)
-		if hasTranscript || hasTools {
+		if caps.Transcriber != nil || caps.Tools != nil {
 			start := func() {
-				if hasTranscript {
+				if caps.Transcriber != nil {
 					replayOnce.Do(func() { sendReplay(dc, info.Replay) })
-					h.wg.Go(func() { forwardTranscripts(scope.mediaCtx(), dc, t, sess) })
+					h.wg.Go(func() { forwardTranscripts(scope.mediaCtx(), dc, caps.Transcriber, sess) })
 				}
-				if hasTools {
-					h.wg.Go(func() { forwardToolCalls(scope.mediaCtx(), dc, td) })
+				if caps.Tools != nil {
+					h.wg.Go(func() { forwardToolCalls(scope.mediaCtx(), dc, caps.Tools) })
 				}
 			}
 			if dc.ReadyState() == webrtc.DataChannelStateOpen {
@@ -381,11 +406,10 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 	// Outbound pump: model audio -> browser.
 	h.wg.Go(func() { writeOutbound(scope.mediaCtx(), out, m, reportStreamFault, info.ID) })
 
-	// VAD interruption monitor: if model supports interruption, listen for barge-in.
-	if m.SupportsInterruption() {
-		if t, ok := m.(model.Transcriber); ok {
-			h.wg.Go(func() { monitorInterruption(scope.mediaCtx(), t) })
-		}
+	// VAD interruption monitor: only when the model resolved as an Interrupter
+	// (implements it AND reports interruption active for this session).
+	if caps.Interrupter != nil {
+		h.wg.Go(func() { monitorInterruption(scope.mediaCtx(), caps.Interrupter) })
 	}
 
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
@@ -407,7 +431,7 @@ func (h *Hub) Serve(offerSDP string, m model.Model, info SessionInfo) (string, e
 	return pc.LocalDescription().SDP, nil
 }
 
-func monitorInterruption(ctx context.Context, t model.Transcriber) {
+func monitorInterruption(ctx context.Context, it model.Interrupter) {
 	ticker := time.NewTicker(10 * time.Millisecond) // Poll for interruption at 100Hz
 	defer ticker.Stop()
 	for {
@@ -415,15 +439,13 @@ func monitorInterruption(ctx context.Context, t model.Transcriber) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			interrupted, err := t.RecvInterrupted()
+			interrupted, err := it.RecvInterrupted()
 			if err != nil {
 				return
 			}
 			if interrupted {
-				if m, ok := t.(model.Model); ok {
-					if err := m.HandleInterrupted(); err != nil {
-						log.Printf("rtc: handle interrupted error: %v", err)
-					}
+				if err := it.HandleInterrupted(); err != nil {
+					log.Printf("rtc: handle interrupted error: %v", err)
 				}
 			}
 		}
@@ -436,8 +458,12 @@ func readInbound(track *webrtc.TrackRemote, m model.Model) {
 		log.Printf("rtc: decoder: %v", err)
 		return
 	}
+	readInboundLoop(track, dec, m)
+}
+
+func readInboundLoop(src rtpReader, dec frameDecoder, sink audioSink) {
 	for {
-		pkt, _, err := track.ReadRTP()
+		pkt, _, err := src.ReadRTP()
 		if err != nil {
 			return
 		}
@@ -448,7 +474,7 @@ func readInbound(track *webrtc.TrackRemote, m model.Model) {
 		if err != nil {
 			continue
 		}
-		if err := m.SendAudio(pcm); err != nil {
+		if err := sink.SendAudio(pcm); err != nil {
 			return
 		}
 	}
@@ -526,7 +552,7 @@ func writeOutboundLoop(
 	}
 }
 
-func forwardTranscripts(ctx context.Context, dc *webrtc.DataChannel, t model.Transcriber, sess *session) {
+func forwardTranscripts(ctx context.Context, dc textSender, t model.Transcriber, sess *session) {
 	for {
 		tr, err := t.RecvTranscript()
 		if err != nil {
@@ -540,51 +566,35 @@ func forwardTranscripts(ctx context.Context, dc *webrtc.DataChannel, t model.Tra
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
-		if err := dc.SendText(marshalLine(line)); err != nil {
+		if err := dc.SendText(dcproto.Encode(line)); err != nil {
 			log.Printf("rtc: transcript send: %v", err)
 			return
 		}
 	}
 }
 
-func sendReplay(dc *webrtc.DataChannel, replay []transcript.Line) {
+func sendReplay(dc textSender, replay []transcript.Line) {
 	for _, line := range replay {
-		if err := dc.SendText(marshalLine(line)); err != nil {
+		if err := dc.SendText(dcproto.Encode(line)); err != nil {
 			log.Printf("rtc: transcript replay send: %v", err)
 			return
 		}
 	}
 }
 
-func marshalLine(line transcript.Line) string {
-	b, _ := json.Marshal(line)
-	return string(b)
-}
-
-// toolCallEnvelope is the data-channel message carrying a model tool call to the
-// browser. The browser replies with a {"type":"tool_result",...} message.
-type toolCallEnvelope struct {
-	Type string          `json:"type"`
-	ID   string          `json:"id"`
-	Name string          `json:"name"`
-	Args json.RawMessage `json:"args"`
-}
-
 // forwardToolCalls relays model tool calls to the browser over the data channel,
 // where the application (e.g. the DJ) executes the function and replies. Exits
 // when the model closes (RecvToolCall errors) or the channel goes away.
-func forwardToolCalls(ctx context.Context, dc *webrtc.DataChannel, td model.ToolDispatcher) {
+func forwardToolCalls(ctx context.Context, dc textSender, td model.ToolDispatcher) {
 	for {
 		call, err := td.RecvToolCall()
 		if err != nil {
 			return
 		}
-		env := toolCallEnvelope{Type: "tool_call", ID: call.ID, Name: call.Name, Args: call.Args}
-		b, _ := json.Marshal(env)
 		if dc.ReadyState() != webrtc.DataChannelStateOpen {
 			return
 		}
-		if err := dc.SendText(string(b)); err != nil {
+		if err := dc.SendText(dcproto.EncodeToolCall(call)); err != nil {
 			return
 		}
 		select {
@@ -593,21 +603,6 @@ func forwardToolCalls(ctx context.Context, dc *webrtc.DataChannel, td model.Tool
 		default:
 		}
 	}
-}
-
-// parseToolResult decodes a {"type":"tool_result",...} envelope the browser sends
-// back after running a tool. Returns false for any other message (plain user text).
-func parseToolResult(data []byte) (model.ToolResult, bool) {
-	var env struct {
-		Type     string          `json:"type"`
-		ID       string          `json:"id"`
-		Name     string          `json:"name"`
-		Response json.RawMessage `json:"response"`
-	}
-	if err := json.Unmarshal(data, &env); err != nil || env.Type != "tool_result" {
-		return model.ToolResult{}, false
-	}
-	return model.ToolResult{ID: env.ID, Name: env.Name, Response: env.Response}, true
 }
 
 // restoredTurns maps recorded transcript lines to the provider-agnostic
